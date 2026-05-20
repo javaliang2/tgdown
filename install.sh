@@ -33,6 +33,14 @@ sep
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_DIR="$SCRIPT_DIR"
 
+if [[ ! -f "$SCRIPT_DIR/bot.py" ]]; then
+  info "检测到远程执行，正在克隆仓库..."
+  command -v git &>/dev/null || die "请先安装 git"
+  git clone https://github.com/你的用户名/tg-pyrogram-bot.git
+  cd tg-pyrogram-bot
+  exec bash install.sh  
+fi
+
 # ═══════════════════════════════════════════════════════════════
 #  STEP 1 · 环境自检
 # ═══════════════════════════════════════════════════════════════
