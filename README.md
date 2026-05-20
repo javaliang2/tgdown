@@ -2,7 +2,7 @@
 
 chmod +x install.sh && ./install.sh
 
-远程安装
+https://my.telegram.org/apps
 
 ## 一键安装
 
