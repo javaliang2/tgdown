@@ -1,5 +1,13 @@
+三个文件放同一文件夹后执行
 
 chmod +x install.sh && ./install.sh
+
+远程安装
+
+## 一键安装
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/javaliang2/tgdown/main/install.sh)
 
 
 支持的媒体类型
