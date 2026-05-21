@@ -36,7 +36,7 @@ INSTALL_DIR="$SCRIPT_DIR"
 if [[ ! -f "$SCRIPT_DIR/bot.py" ]]; then
   info "检测到远程执行，正在克隆仓库..."
   command -v git &>/dev/null || die "请先安装 git"
-  git clone https://github.com/javaliang2/tgdown.git
+  git clone https://github.com/lje02/tgdown.git
   cd tgdown
   exec bash install.sh  
 fi
