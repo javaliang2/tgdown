@@ -97,67 +97,70 @@ check_python() {
   echo "$py"
 }
 
-PYTHON=$(check_python)
-
-if [[ -z "$PYTHON" ]]; then
-  warn "未找到 Python 3.9+，将尝试自动安装..."
-  case "$OS" in
-    debian)
-      $SUDO apt-get update -qq
-      $SUDO apt-get install -y python3 python3-venv python3-pip || true
-      ;;
-    redhat)
-      if command -v dnf &>/dev/null; then
-        $SUDO dnf install -y python3 python3-pip || true
-      else
-        $SUDO yum install -y python3 python3-pip || true
-      fi
-      ;;
-    arch)
-      $SUDO pacman -Sy --noconfirm python python-pip || true
-      ;;
-    macos)
-      if command -v brew &>/dev/null; then
-        brew install python3 || true
-      else
-        die "请先安装 Homebrew（https://brew.sh）或手动安装 Python 3.9+"
-      fi
-      ;;
-    *) die "无法自动安装 Python，请手动安装 Python 3.9+ 后重试" ;;
-  esac
-
+setup_python_env() {
   PYTHON=$(check_python)
+
   if [[ -z "$PYTHON" ]]; then
-    warn "自动安装后仍未找到 Python 3.9+"
-    info "Debian/Ubuntu 用户可添加 deadsnakes PPA 安装高版本 Python："
-    info "  sudo add-apt-repository ppa:deadsnakes/ppa"
-    info "  sudo apt install python3.9  （或 python3.10 / 3.11 等）"
-    die "请手动安装 Python 3.9+ 后重新运行本脚本"
+    warn "未找到 Python 3.9+，将尝试自动安装..."
+    case "$OS" in
+      debian)
+        $SUDO apt-get update -qq
+        # 顺便把 venv 和 pip 一起装了，减少后续步骤
+        $SUDO apt-get install -y python3 python3-venv python3-pip || true
+        ;;
+      redhat)
+        if command -v dnf &>/dev/null; then
+          $SUDO dnf install -y python3 python3-pip || true
+        else
+          $SUDO yum install -y python3 python3-pip || true
+        fi
+        ;;
+      arch)
+        $SUDO pacman -Sy --noconfirm python python-pip || true
+        ;;
+      macos)
+        if command -v brew &>/dev/null; then
+          brew install python3 || true
+        else
+          die "请先安装 Homebrew（https://brew.sh）或手动安装 Python 3.9+"
+        fi
+        ;;
+      *) die "无法自动安装 Python，请手动安装 Python 3.9+ 后重试" ;;
+    esac
+
+    PYTHON=$(check_python)
+    if [[ -z "$PYTHON" ]]; then
+      warn "自动安装后仍未找到 Python 3.9+"
+      info "Debian/Ubuntu 用户可添加 deadsnakes PPA 安装高版本 Python："
+      info "  sudo add-apt-repository ppa:deadsnakes/ppa"
+      info "  sudo apt install python3.9  （或 python3.10 / 3.11 等）"
+      die "请手动安装 Python 3.9+ 后重新运行本脚本"
+    fi
   fi
-fi
 
-PY_VER=$("$PYTHON" -c "import sys; v=sys.version_info; print(f'{v.major}.{v.minor}.{v.micro}')")
-ok "Python $PY_VER  ($PYTHON)"
+  local py_full_ver
+  py_full_ver=$("$PYTHON" -c "import sys; v=sys.version_info; print(f'{v.major}.{v.minor}.{v.micro}')")
+  ok "Python $py_full_ver  ($PYTHON)"
 
-if ! "$PYTHON" -m pip --version &>/dev/null; then
-  warn "pip 未找到，尝试安装..."
-  case "$OS" in
-    debian) $SUDO apt-get install -y python3-pip || true ;;
-    redhat) $SUDO yum install -y python3-pip 2>/dev/null || $SUDO dnf install -y python3-pip || true ;;
-    arch)   $SUDO pacman -Sy --noconfirm python-pip || true ;;
-    macos)  "$PYTHON" -m ensurepip --upgrade || true ;;
-    *)      die "请手动安装 pip" ;;
-  esac
+  # 检查并安装 pip
   if ! "$PYTHON" -m pip --version &>/dev/null; then
-    die "pip 安装失败，请手动处理"
+    warn "pip 未找到，尝试安装..."
+    case "$OS" in
+      debian) $SUDO apt-get install -y python3-pip || true ;;
+      redhat) $SUDO yum install -y python3-pip 2>/dev/null || $SUDO dnf install -y python3-pip || true ;;
+      arch)   $SUDO pacman -Sy --noconfirm python-pip || true ;;
+      macos)  "$PYTHON" -m ensurepip --upgrade || true ;;
+      *)      die "请手动安装 pip" ;;
+    esac
+    if ! "$PYTHON" -m pip --version &>/dev/null; then
+      die "pip 安装失败，请手动处理"
+    fi
   fi
-fi
-ok "pip 可用"
+  ok "pip 可用"
 
-# 检测 venv 模块
-ensure_venv() {
-  # 先尝试直接使用，成功就返回
-  if "$PYTHON" -m venv --help &>/dev/null 2>&1; then
+  # 检查并安装 venv
+  # 修复：去掉了冗余的 2>&1，&>/dev/null 已经包含了标准输出和标准错误
+  if "$PYTHON" -m venv --help &>/dev/null; then
     ok "venv 模块可用"
     return 0
   fi
@@ -173,7 +176,8 @@ ensure_venv() {
       warn "将安装 python${py_ver}-venv ..."
       $SUDO apt-get update -qq
       $SUDO apt-get install -y "python${py_ver}-venv" || {
-        err "安装 python${py_ver}-venv 失败"
+        # 假设你有 err 或 die 函数
+        echo "安装 python${py_ver}-venv 失败" >&2
         return 1
       }
       ;;
@@ -197,12 +201,16 @@ ensure_venv() {
   esac
 
   # 安装后再次验证
-  if "$PYTHON" -m venv --help &>/dev/null 2>&1; then
+  if "$PYTHON" -m venv --help &>/dev/null; then
     ok "venv 模块可用"
+    return 0
   else
     die "venv 模块安装失败，请手动安装 python${py_ver}-venv 或对应系统包"
   fi
 }
+
+# 调用函数
+setup_python_env
 
 check_network() {
   if command -v curl &>/dev/null; then
