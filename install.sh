@@ -154,14 +154,38 @@ if ! "$PYTHON" -m pip --version &>/dev/null; then
 fi
 ok "pip 可用"
 
+# 检测 venv 模块（智能匹配 Python 小版本）
 if ! "$PYTHON" -m venv --help &>/dev/null 2>&1; then
-  warn "python3-venv 缺失，尝试安装..."
+  warn "缺少 venv 模块，尝试自动安装..."
+
+  # 获取 Python 
+  PY_MAJOR_MINOR=$("$PYTHON" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
   case "$OS" in
-    debian) $SUDO apt-get install -y python3-venv || true ;;
-    *) warn "请手动安装 venv 模块" ;;
+    debian)
+      warn "将安装 python${PY_MAJOR_MINOR}-venv ..."
+      $SUDO apt-get update -qq
+      $SUDO apt-get install -y "python${PY_MAJOR_MINOR}-venv" || true
+      ;;
+    redhat)
+      # RHEL/CentOS
+      $SUDO yum reinstall -y python3 2>/dev/null || $SUDO dnf reinstall -y python3
+      ;;
+    arch)
+      # a
+      warn "Arch 系统一般已包含 venv，请检查 python 包完整性"
+      ;;
+    macos)
+
+      warn "请检查 Homebrew 安装的 Python 是否完整，可尝试 brew reinstall python3"
+      ;;
+    *)
+      warn "请手动安装 Python ${PY_MAJOR_MINOR} 的 venv 模块"
+      ;;
   esac
+
+  # 安装后再次严格检查
   if ! "$PYTHON" -m venv --help &>/dev/null 2>&1; then
-    die "venv 模块安装失败，请手动安装 python3-venv 或对应系统包"
+    die "venv 模块安装失败，请手动安装 python${PY_MAJOR_MINOR}-venv 或对应系统包"
   fi
 fi
 ok "venv 模块可用"
