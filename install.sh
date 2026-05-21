@@ -84,9 +84,8 @@ check_python() {
   local py=""
   for cmd in python3.12 python3.11 python3.10 python3.9 python3 python; do
     if command -v "$cmd" &>/dev/null; then
-      local ver
-      ver=$("$cmd" -c "import sys; print(sys.version_info[:2])" 2>/dev/null || true)
-      if [[ "$ver" > "(3, 8)" ]]; then   # 字典序比较足够用
+      # 让 Python 自己判断是否 >= 3.9，符合则退出码为 0
+      if "$cmd" -c "import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)" &>/dev/null; then
         py="$cmd"
         break
       fi
