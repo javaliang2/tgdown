@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # =============================================================
-#  Telegram 自动下载机器人 · 一键安装脚本 (增强交互版)
+#  Telegram 自动下载机器人 · 一键安装脚本
 #  支持：Ubuntu / Debian / CentOS / RHEL / Arch / macOS
 # =============================================================
 set -euo pipefail
 
-# ── 颜色 & 符号 ───────────────────────────────────────────────
-R='\033[0;31m'  G='\033[0;32m'  Y='\033[0;33m'
-B='\033[0;34m'  C='\033[0;36m'  W='\033[1;37m'  N='\033[0m'
+# ── 颜色 & 输出工具 ───────────────────────────────────────────
+R='\033[0;31m' G='\033[0;32m' Y='\033[0;33m'
+B='\033[0;34m' C='\033[0;36m' W='\033[1;37m' N='\033[0m'
 BOLD='\033[1m'
 
 ok()   { echo -e "${G}  ✔  ${N}$*"; }
@@ -38,25 +38,35 @@ if [[ ! -f "$SCRIPT_DIR/bot.py" ]]; then
   command -v git &>/dev/null || die "请先安装 git"
   git clone https://github.com/lje02/tgdown.git
   cd tgdown
-  exec bash install.sh  
+  exec bash install.sh
 fi
 
+# ── 全局变量 ─────────────────────────────────────────────────
+PYTHON=""
+VENV_DIR="$INSTALL_DIR/venv"
+VENV_PYTHON="$VENV_DIR/bin/python"
+VENV_PIP="$VENV_DIR/bin/pip"
+SUDO=""
+
 # ═══════════════════════════════════════════════════════════════
-#  STEP 1 · 环境自检 (已修复: Python版本/curl缺失/venv检测)
+#  STEP 1 · 环境自检
 # ═══════════════════════════════════════════════════════════════
 echo -e "\n${W}${BOLD}[1/5] 环境自检${N}"
 sep
 
+# ── 检测操作系统 ──────────────────────────────────────────────
 detect_os() {
   if [[ "$OSTYPE" == "darwin"* ]]; then
-    echo "macos"
-  elif [[ -f /etc/os-release ]]; then
+    echo "macos"; return
+  fi
+  if [[ -f /etc/os-release ]]; then
+    # shellcheck source=/dev/null
     source /etc/os-release
-    case "$ID" in
-      ubuntu|debian|linuxmint|pop) echo "debian" ;;
-      centos|rhel|fedora|rocky|almalinux) echo "redhat" ;;
-      arch|manjaro|endeavouros) echo "arch" ;;
-      *) echo "unknown" ;;
+    case "${ID:-}" in
+      ubuntu|debian|linuxmint|pop)              echo "debian"  ;;
+      centos|rhel|fedora|rocky|almalinux)       echo "redhat"  ;;
+      arch|manjaro|endeavouros)                 echo "arch"    ;;
+      *)                                        echo "unknown" ;;
     esac
   else
     echo "unknown"
@@ -66,161 +76,124 @@ detect_os() {
 OS=$(detect_os)
 info "操作系统：$(uname -s) / 发行版：$OS"
 
-IS_ROOT=false
-[[ $EUID -eq 0 ]] && IS_ROOT=true
-$IS_ROOT && info "以 root 身份运行" || info "以普通用户运行（sudo 将按需调用）"
-
-SUDO=""
-if ! $IS_ROOT && command -v sudo &>/dev/null; then
-  SUDO="sudo"
+# ── 权限检测 ──────────────────────────────────────────────────
+if [[ $EUID -eq 0 ]]; then
+  info "以 root 身份运行"
+else
+  info "以普通用户运行（sudo 将按需调用）"
+  command -v sudo &>/dev/null && SUDO="sudo"
 fi
 
-check_python() {
-  local py=""
+# ── Python 版本检测（要求 3.9+） ──────────────────────────────
+find_python() {
+  local cmd ver major minor
   for cmd in python3.12 python3.11 python3.10 python3.9 python3 python; do
-    if command -v "$cmd" &>/dev/null; then
-      local ver_tuple
-      ver_tuple=$("$cmd" -c "import sys; print(sys.version_info[:2])" 2>/dev/null || true)
-      if [[ -n "$ver_tuple" ]]; then
-        local major minor
-        major=$(echo "$ver_tuple" | grep -oP '\d+(?=,)' | head -1)
-        minor=$(echo "$ver_tuple" | grep -oP '(?<=, )\d+' | tail -1)
-        if [[ -n "$major" && -n "$minor" ]]; then
-          if (( major > 3 || ( major == 3 && minor >= 9 ) )); then
-            py="$cmd"
-            break
-          fi
-        fi
-      fi
+    command -v "$cmd" &>/dev/null || continue
+    # 直接用算术比较，避免正则解析
+    read -r major minor < <(
+      "$cmd" -c "import sys; v=sys.version_info; print(v.major, v.minor)" 2>/dev/null
+    ) || continue
+    if (( major > 3 || ( major == 3 && minor >= 9 ) )); then
+      echo "$cmd"; return 0
     fi
   done
-  echo "$py"
+  return 1
 }
 
-setup_python_env() {
-  PYTHON=$(check_python)
+# ── 安装包管理器辅助 ──────────────────────────────────────────
+pkg_install() {
+  # 用法: pkg_install <pkg_debian> [<pkg_redhat>] [<pkg_arch>]
+  local deb="${1:-}" rpm="${2:-$1}" arc="${3:-$1}"
+  case "$OS" in
+    debian) $SUDO apt-get install -y "$deb" ;;
+    redhat) command -v dnf &>/dev/null \
+              && $SUDO dnf install -y "$rpm" \
+              || $SUDO yum install -y "$rpm" ;;
+    arch)   $SUDO pacman -Sy --noconfirm "$arc" ;;
+    macos)  command -v brew &>/dev/null \
+              && brew install python3 \
+              || die "请先安装 Homebrew (https://brew.sh) 或手动安装 Python 3.9+" ;;
+    *)      die "无法自动安装依赖，请手动安装 Python 3.9+" ;;
+  esac
+}
 
-  if [[ -z "$PYTHON" ]]; then
-    warn "未找到 Python 3.9+，将尝试自动安装..."
-    case "$OS" in
-      debian)
-        $SUDO apt-get update -qq
-        # 顺便把 venv 和 pip 一起装了，减少后续步骤
-        $SUDO apt-get install -y python3 python3-venv python3-pip || true
-        ;;
-      redhat)
-        if command -v dnf &>/dev/null; then
-          $SUDO dnf install -y python3 python3-pip || true
-        else
-          $SUDO yum install -y python3 python3-pip || true
-        fi
-        ;;
-      arch)
-        $SUDO pacman -Sy --noconfirm python python-pip || true
-        ;;
-      macos)
-        if command -v brew &>/dev/null; then
-          brew install python3 || true
-        else
-          die "请先安装 Homebrew（https://brew.sh）或手动安装 Python 3.9+"
-        fi
-        ;;
-      *) die "无法自动安装 Python，请手动安装 Python 3.9+ 后重试" ;;
-    esac
+# ── 安装 Python ───────────────────────────────────────────────
+install_python() {
+  warn "未找到 Python 3.9+，正在自动安装..."
+  case "$OS" in
+    debian) $SUDO apt-get update -qq
+            $SUDO apt-get install -y python3 python3-venv python3-pip ;;
+    redhat) pkg_install python3 python3-pip ;;
+    arch)   pkg_install python python-pip ;;
+    macos)  pkg_install python3 ;;
+    *)      die "无法自动安装 Python，请手动安装 Python 3.9+" ;;
+  esac
+}
 
-    PYTHON=$(check_python)
-    if [[ -z "$PYTHON" ]]; then
-      warn "自动安装后仍未找到 Python 3.9+"
-      info "Debian/Ubuntu 用户可添加 deadsnakes PPA 安装高版本 Python："
-      info "  sudo add-apt-repository ppa:deadsnakes/ppa"
-      info "  sudo apt install python3.9  （或 python3.10 / 3.11 等）"
-      die "请手动安装 Python 3.9+ 后重新运行本脚本"
-    fi
-  fi
-
-  local py_full_ver
-  py_full_ver=$("$PYTHON" -c "import sys; v=sys.version_info; print(f'{v.major}.{v.minor}.{v.micro}')")
-  ok "Python $py_full_ver  ($PYTHON)"
-
-  # 检查并安装 pip
-  if ! "$PYTHON" -m pip --version &>/dev/null; then
-    warn "pip 未找到，尝试安装..."
-    case "$OS" in
-      debian) $SUDO apt-get install -y python3-pip || true ;;
-      redhat) $SUDO yum install -y python3-pip 2>/dev/null || $SUDO dnf install -y python3-pip || true ;;
-      arch)   $SUDO pacman -Sy --noconfirm python-pip || true ;;
-      macos)  "$PYTHON" -m ensurepip --upgrade || true ;;
-      *)      die "请手动安装 pip" ;;
-    esac
-    if ! "$PYTHON" -m pip --version &>/dev/null; then
-      die "pip 安装失败，请手动处理"
-    fi
-  fi
+# ── 安装 pip ──────────────────────────────────────────────────
+ensure_pip() {
+  "$PYTHON" -m pip --version &>/dev/null && return 0
+  warn "pip 未找到，尝试安装..."
+  case "$OS" in
+    debian) $SUDO apt-get install -y python3-pip ;;
+    redhat) pkg_install python3-pip ;;
+    arch)   pkg_install python-pip ;;
+    macos)  "$PYTHON" -m ensurepip --upgrade ;;
+    *)      die "请手动安装 pip" ;;
+  esac
+  "$PYTHON" -m pip --version &>/dev/null || die "pip 安装失败"
   ok "pip 可用"
+}
 
-  # 检查并安装 venv
-  # 修复：去掉了冗余的 2>&1，&>/dev/null 已经包含了标准输出和标准错误
-  if "$PYTHON" -m venv --help &>/dev/null; then
-    ok "venv 模块可用"
-    return 0
-  fi
-
-  warn "缺少 venv 模块，尝试自动安装..."
-
-  # 获取 Python 主次版本号，例如 "3.11"
+# ── 安装 venv ─────────────────────────────────────────────────
+ensure_venv() {
+  "$PYTHON" -m venv --help &>/dev/null && return 0
+  warn "缺少 venv 模块，尝试安装..."
   local py_ver
   py_ver=$("$PYTHON" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
-
   case "$OS" in
-    debian)
-      warn "将安装 python${py_ver}-venv ..."
-      $SUDO apt-get update -qq
-      $SUDO apt-get install -y "python${py_ver}-venv" || {
-        # 假设你有 err 或 die 函数
-        echo "安装 python${py_ver}-venv 失败" >&2
-        return 1
-      }
-      ;;
-    redhat)
-      # RHEL/CentOS 的 venv 通常包含在主 python3 包中，尝试重装
-      if command -v dnf &>/dev/null; then
-        $SUDO dnf reinstall -y python3
-      else
-        $SUDO yum reinstall -y python3
-      fi
-      ;;
-    arch)
-      warn "Arch 系统一般已包含 venv，请检查 python 包完整性"
-      ;;
-    macos)
-      warn "请检查 Homebrew 安装的 Python 是否完整，可尝试 brew reinstall python3"
-      ;;
-    *)
-      warn "请手动安装 Python ${py_ver} 的 venv 模块"
-      ;;
+    debian) $SUDO apt-get update -qq
+            $SUDO apt-get install -y "python${py_ver}-venv" ;;
+    redhat) command -v dnf &>/dev/null \
+              && $SUDO dnf reinstall -y python3 \
+              || $SUDO yum reinstall -y python3 ;;
+    arch)   warn "Arch 系 venv 应已内置，请检查 python 包完整性" ;;
+    macos)  warn "请尝试 brew reinstall python3" ;;
+    *)      warn "请手动安装 python${py_ver}-venv" ;;
   esac
-
-  # 安装后再次验证
-  if "$PYTHON" -m venv --help &>/dev/null; then
-    ok "venv 模块可用"
-    return 0
-  else
-    die "venv 模块安装失败，请手动安装 python${py_ver}-venv 或对应系统包"
-  fi
+  "$PYTHON" -m venv --help &>/dev/null \
+    || die "venv 安装失败，请手动安装 python${py_ver}-venv"
+  ok "venv 模块可用"
 }
 
-# 调用函数
-setup_python_env
+# ── 主流程：初始化 Python 环境 ────────────────────────────────
+setup_python() {
+  if ! PYTHON=$(find_python); then
+    install_python
+    PYTHON=$(find_python) || die "Python 安装后仍未找到，请手动安装 Python 3.9+"
+  fi
 
+  local py_ver
+  py_ver=$("$PYTHON" -c "import sys; v=sys.version_info; print(f'{v.major}.{v.minor}.{v.micro}')")
+  ok "Python $py_ver  ($PYTHON)"
+
+  ensure_pip
+  ensure_venv
+}
+
+setup_python
+
+# ── 网络连通性检测 ────────────────────────────────────────────
 check_network() {
   if command -v curl &>/dev/null; then
-    curl -sf --max-time 5 https://api.telegram.org > /dev/null 2>&1
+    curl -sf --max-time 5 https://api.telegram.org > /dev/null
   elif command -v wget &>/dev/null; then
-    wget -q --timeout=5 -O /dev/null https://api.telegram.org > /dev/null 2>&1
+    wget -q --timeout=5 -O /dev/null https://api.telegram.org
   else
     return 1
   fi
 }
+
 if check_network; then
   ok "网络连通（Telegram 可达）"
 else
@@ -233,18 +206,16 @@ fi
 echo -e "\n${W}${BOLD}[2/5] 安装 Python 依赖${N}"
 sep
 
-VENV_DIR="$INSTALL_DIR/venv"
 if [[ -d "$VENV_DIR" ]]; then
-  info "已存在虚拟环境，跳过创建"
+  info "虚拟环境已存在，跳过创建"
 else
   info "创建虚拟环境 → $VENV_DIR"
   "$PYTHON" -m venv "$VENV_DIR"
   ok "虚拟环境创建成功"
 fi
 
+# shellcheck source=/dev/null
 source "$VENV_DIR/bin/activate"
-VENV_PYTHON="$VENV_DIR/bin/python"
-VENV_PIP="$VENV_DIR/bin/pip"
 
 info "升级 pip..."
 "$VENV_PIP" install --upgrade pip -q
@@ -259,6 +230,7 @@ REQ
 fi
 
 info "安装依赖包..."
+# 只显示成功/失败行，过滤掉无意义的进度输出
 "$VENV_PIP" install -r "$REQUIREMENTS" -q --no-warn-script-location 2>&1 \
   | grep -E "^(Successfully|ERROR|error)" || true
 
@@ -266,147 +238,97 @@ for pkg in pyrogram dotenv; do
   if "$VENV_PYTHON" -c "import $pkg" 2>/dev/null; then
     ok "import $pkg"
   else
-    die "包 $pkg 安装失败，请检查网络或手动运行: $VENV_PIP install -r requirements.txt"
+    die "包 $pkg 安装失败，请检查网络或手动运行：$VENV_PIP install -r requirements.txt"
   fi
 done
 
 # ═══════════════════════════════════════════════════════════════
-#  STEP 3 · 交互式信息采集 (优化版)
+#  STEP 3 · 交互式配置采集
 # ═══════════════════════════════════════════════════════════════
 echo -e "\n${W}${BOLD}[3/5] 填写配置信息${N}"
 sep
 echo -e "${Y}  所有信息仅写入本地 .env 文件，不会上传到任何地方${N}\n"
 
-# ── 工具函数：清空输入中的任何空白字符（空格、制表、换行） ──
-sanitize() {
-  local val="$1"
-  # 删除所有空白字符
-  val="${val//[[:space:]]/}"
-  echo "$val"
-}
+# ── 工具：去除所有空白字符 ────────────────────────────────────
+sanitize() { echo "${1//[[:space:]]/}"; }
 
-# ── 辅助：读取非空输入（带重试上限） ──
+# ── 读取必填项（带重试）────────────────────────────────────────
+# 用法: prompt_required <varname> <提示文字> [secret=true]
 prompt_required() {
-  local var_name="$1"
-  local prompt_text="$2"
-  local secret="${3:-false}"
-  local max_retries=5
-  local attempt=0
-  local value=""
-
+  local var_name="$1" prompt_text="$2" secret="${3:-false}"
+  local value="" attempt=0 max_retries=5
   while true; do
     if $secret; then
-      read -rsp "  ${C}${prompt_text}${N}: " value
-      echo
+      read -rsp "  ${C}${prompt_text}${N}: " value; echo
     else
-      read -rp "  ${C}${prompt_text}${N}: " value
+      read -rp  "  ${C}${prompt_text}${N}: " value
     fi
     value=$(sanitize "$value")
-
     if [[ -n "$value" ]]; then
       printf -v "$var_name" '%s' "$value"
       return 0
     fi
-
-    ((attempt++))
-    if [[ $attempt -ge $max_retries ]]; then
-      err "已达到最大重试次数 ($max_retries)，安装终止"
-      exit 1
-    fi
+    (( attempt++ ))
+    (( attempt >= max_retries )) && die "已达最大重试次数 ($max_retries)，安装终止"
     err "输入不能为空，剩余重试次数：$((max_retries - attempt))"
   done
 }
 
-# ── 辅助：读取可选输入（带默认值） ──
+# ── 读取可选项（带默认值）─────────────────────────────────────
+# 用法: prompt_optional <varname> <提示文字> <默认值>
 prompt_optional() {
-  local var_name="$1"
-  local prompt_text="$2"
-  local default="$3"
-  local value=""
+  local var_name="$1" prompt_text="$2" default="$3" value=""
   read -rp "  ${C}${prompt_text}${N} [${Y}${default}${N}]: " value
   value=$(sanitize "$value")
-  [[ -z "$value" ]] && value="$default"
-  printf -v "$var_name" '%s' "$value"
+  printf -v "$var_name" '%s' "${value:-$default}"
 }
 
-# ── 配置采集函数（返回 0 表示确认，1 表示需要重新填写） ──
-collect_config() {
-  echo -e "\n  ${W}▸ Telegram API 凭据${N}"
-  echo -e "  获取地址：${B}https://my.telegram.org/apps${N}  （登录后创建 App）\n"
-
-  # API_ID
-  while true; do
-    prompt_required API_ID "API_ID（纯数字，例如 12345678）"
-    if [[ "$API_ID" =~ ^[0-9]+$ ]]; then
-      break
-    else
-      err "API_ID 必须是纯数字，请重新输入"
-    fi
+# ── 校验白名单格式（逗号分隔的纯数字 user_id）────────────────
+validate_allowed_users() {
+  local input="$1"
+  [[ -z "$input" ]] && return 0  # 空值合法（不限用户）
+  local id
+  IFS=',' read -ra IDS <<< "$input"
+  for id in "${IDS[@]}"; do
+    [[ "$id" =~ ^[0-9]+$ ]] || { err "非法 user_id: '$id'（必须为纯数字）"; return 1; }
   done
-
-  # API_HASH
-  while true; do
-    prompt_required API_HASH "API_HASH（32位十六进制字符串）"
-    if [[ "${#API_HASH}" -eq 32 && "$API_HASH" =~ ^[0-9a-fA-F]+$ ]]; then
-      break
-    else
-      err "API_HASH 应为 32 位十六进制字符串（当前长度 ${#API_HASH}），请重新输入"
-    fi
-  done
-
-  echo -e "\n  ${W}▸ Bot Token${N}"
-  echo -e "  获取方式：在 Telegram 找 ${B}@BotFather${N} → /newbot\n"
-
-  while true; do
-    prompt_required BOT_TOKEN "BOT_TOKEN（格式：数字:字母数字串）" true
-    if [[ "$BOT_TOKEN" =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]]; then
-      break
-    else
-      err "Token 格式不正确（应为 123456:ABC...），请重新输入"
-    fi
-  done
-
-  echo -e "\n  ${W}▸ 下载目录配置${N}\n"
-  prompt_optional DOWNLOAD_ROOT "下载根目录" "$INSTALL_DIR/downloads"
-
-  prompt_optional ORGANIZE_BY_DATE "按日期子目录归档（true/false）" "true"
-  [[ "$ORGANIZE_BY_DATE" != "false" ]] && ORGANIZE_BY_DATE="true"
-
-  prompt_optional PROGRESS_UPDATE_SEC "进度消息刷新间隔（秒）" "2.0"
-
-  echo -e "\n  ${W}▸ 用户白名单${N}"
-  echo -e "  ${Y}留空 = 所有人均可使用；多个 ID 用逗号分隔${N}"
-  echo -e "  获取自己的 user_id：在 Telegram 找 ${B}@userinfobot${N} 发任意消息\n"
-  read -rp "  ${C}ALLOWED_USERS${N}（可留空）: " ALLOWED_USERS
-  ALLOWED_USERS=$(sanitize "$ALLOWED_USERS")
-
-  # 如果非空，验证每个 ID 是否为数字
-  if [[ -n "$ALLOWED_USERS" ]]; then
-    IFS=',' read -ra IDS <<< "$ALLOWED_USERS"
-    for id in "${IDS[@]}"; do
-      if [[ ! "$id" =~ ^[0-9]+$ ]]; then
-        err "白名单包含非法 user_id: '$id'（必须为纯数字），请重新填写"
-        return 1
-      fi
-    done
-  fi
-
   return 0
 }
 
-# ── 主交互循环：采集 → 预览 → 确认/修改 ──
-while true; do
-  # 重置变量
-  API_ID=""; API_HASH=""; BOT_TOKEN=""
-  DOWNLOAD_ROOT=""; ORGANIZE_BY_DATE=""; PROGRESS_UPDATE_SEC=""; ALLOWED_USERS=""
+# ── 单项修改菜单 ──────────────────────────────────────────────
+modify_single_field() {
+  echo -e "\n  ${Y}请选择要修改的项：${N}"
+  echo "    1) API_ID"
+  echo "    2) API_HASH"
+  echo "    3) BOT_TOKEN"
+  echo "    4) 下载根目录"
+  echo "    5) 按日期归档"
+  echo "    6) 进度刷新间隔"
+  echo "    7) 白名单"
+  echo "    8) 全部重新填写"
+  local opt
+  read -rp "  ${C}输入数字 (1-8)${N}: " opt
+  case "$opt" in
+    1) echo; prompt_required API_ID   "API_ID（纯数字）" ;;
+    2) echo; prompt_required API_HASH "API_HASH（32位十六进制）" ;;
+    3) echo; prompt_required BOT_TOKEN "BOT_TOKEN" true ;;
+    4) echo; prompt_optional DOWNLOAD_ROOT      "下载根目录"              "$DOWNLOAD_ROOT" ;;
+    5) echo; prompt_optional ORGANIZE_BY_DATE   "按日期归档（true/false）" "$ORGANIZE_BY_DATE" ;;
+    6) echo; prompt_optional PROGRESS_UPDATE_SEC "进度刷新间隔（秒）"      "$PROGRESS_UPDATE_SEC" ;;
+    7) echo
+       while true; do
+         read -rp "  ${C}ALLOWED_USERS${N}（可留空）: " ALLOWED_USERS
+         ALLOWED_USERS=$(sanitize "$ALLOWED_USERS")
+         validate_allowed_users "$ALLOWED_USERS" && break
+       done ;;
+    8) return 1 ;;   # 信号：需要全部重填
+    *) err "无效选项" ;;
+  esac
+  return 0
+}
 
-  # 采集所有配置
-  if ! collect_config; then
-    echo -e "\n${Y}  重新填写所有配置项...${N}\n"
-    continue
-  fi
-
-  # ── 预览配置 ──
+# ── 显示配置预览 ──────────────────────────────────────────────
+show_preview() {
   echo -e "\n${W}${BOLD}  ═══════════ 配置预览 ═══════════${N}"
   echo -e "  API_ID            : ${G}${API_ID}${N}"
   echo -e "  API_HASH          : ${G}${API_HASH:0:6}****${N}"
@@ -420,51 +342,91 @@ while true; do
     echo -e "  白名单            : ${G}${ALLOWED_USERS}${N}"
   fi
   echo -e "${W}  ═════════════════════════════════${N}"
+}
 
-  # 确认操作
+# ── 采集一轮完整配置（返回 0 成功，1 需重填）─────────────────
+collect_config() {
+  echo -e "\n  ${W}▸ Telegram API 凭据${N}"
+  echo -e "  获取地址：${B}https://my.telegram.org/apps${N}  （登录后创建 App）\n"
+
+  # API_ID：纯数字
+  while true; do
+    prompt_required API_ID "API_ID（纯数字，例如 12345678）"
+    [[ "$API_ID" =~ ^[0-9]+$ ]] && break
+    err "API_ID 必须是纯数字，请重新输入"
+  done
+
+  # API_HASH：32 位十六进制
+  while true; do
+    prompt_required API_HASH "API_HASH（32位十六进制字符串）"
+    [[ ${#API_HASH} -eq 32 && "$API_HASH" =~ ^[0-9a-fA-F]+$ ]] && break
+    err "API_HASH 应为 32 位十六进制字符串（当前 ${#API_HASH} 位），请重新输入"
+  done
+
+  echo -e "\n  ${W}▸ Bot Token${N}"
+  echo -e "  获取方式：在 Telegram 找 ${B}@BotFather${N} → /newbot\n"
+
+  # BOT_TOKEN：数字:字符串
+  while true; do
+    prompt_required BOT_TOKEN "BOT_TOKEN（格式：数字:字母数字串）" true
+    [[ "$BOT_TOKEN" =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]] && break
+    err "Token 格式不正确（应为 123456:ABC...），请重新输入"
+  done
+
+  echo -e "\n  ${W}▸ 下载目录配置${N}\n"
+  prompt_optional DOWNLOAD_ROOT       "下载根目录"               "$INSTALL_DIR/downloads"
+  prompt_optional ORGANIZE_BY_DATE    "按日期子目录归档（true/false）" "true"
+  prompt_optional PROGRESS_UPDATE_SEC "进度消息刷新间隔（秒）"    "2.0"
+  # 非 false 均视为 true
+  [[ "$ORGANIZE_BY_DATE" == "false" ]] || ORGANIZE_BY_DATE="true"
+
+  echo -e "\n  ${W}▸ 用户白名单${N}"
+  echo -e "  ${Y}留空 = 所有人均可使用；多个 ID 用逗号分隔${N}"
+  echo -e "  获取自己的 user_id：在 Telegram 找 ${B}@userinfobot${N} 发任意消息\n"
+
+  while true; do
+    read -rp "  ${C}ALLOWED_USERS${N}（可留空）: " ALLOWED_USERS
+    ALLOWED_USERS=$(sanitize "$ALLOWED_USERS")
+    validate_allowed_users "$ALLOWED_USERS" && break
+    err "请重新输入白名单"
+  done
+
+  return 0
+}
+
+# ── 主交互循环 ────────────────────────────────────────────────
+API_ID="" API_HASH="" BOT_TOKEN=""
+DOWNLOAD_ROOT="" ORGANIZE_BY_DATE="" PROGRESS_UPDATE_SEC="" ALLOWED_USERS=""
+
+while true; do
+  collect_config || { echo -e "\n${Y}  重新填写所有配置项...${N}\n"; continue; }
+
+  show_preview
+
   read -rp $'\n  '"${C}是否确认以上配置？${N} [${G}Y${N}/${Y}n${N}/${Y}m${N}(修改单项)]: " CONFIRM
-  CONFIRM=$(echo "$CONFIRM" | tr '[:upper:]' '[:lower:]')
-
-  case "$CONFIRM" in
+  case "$(echo "$CONFIRM" | tr '[:upper:]' '[:lower:]')" in
     y|yes|"")
       echo -e "\n${G}  配置已确认，即将写入...${N}"
       break
       ;;
     m|modify)
-      echo -e "\n  ${Y}  请选择要修改的项：${N}"
-      echo "    1) API_ID"
-      echo "    2) API_HASH"
-      echo "    3) BOT_TOKEN"
-      echo "    4) 下载根目录"
-      echo "    5) 按日期归档"
-      echo "    6) 进度刷新间隔"
-      echo "    7) 白名单"
-      echo "    8) 全部重新填写"
-      read -rp "  ${C}输入数字 (1-8)${N}: " MOD_OPT
-      case "$MOD_OPT" in
-        1) echo; prompt_required API_ID "API_ID（纯数字）"; continue ;;
-        2) echo; prompt_required API_HASH "API_HASH（32位十六进制）"; continue ;;
-        3) echo; prompt_required BOT_TOKEN "BOT_TOKEN" true; continue ;;
-        4) echo; prompt_optional DOWNLOAD_ROOT "下载根目录" "$DOWNLOAD_ROOT"; continue ;;
-        5) echo; prompt_optional ORGANIZE_BY_DATE "按日期子目录归档（true/false）" "$ORGANIZE_BY_DATE"; continue ;;
-        6) echo; prompt_optional PROGRESS_UPDATE_SEC "进度消息刷新间隔（秒）" "$PROGRESS_UPDATE_SEC"; continue ;;
-        7) echo; read -rp "  ${C}ALLOWED_USERS${N}（可留空）: " ALLOWED_USERS
-           ALLOWED_USERS=$(sanitize "$ALLOWED_USERS"); continue ;;
-        8) echo -e "\n${Y}  重新填写全部配置...${N}\n"; continue ;;
-        *) err "无效选项，返回预览"; continue ;;
-      esac
+      modify_single_field || {
+        # 选项 8：全部重填，先重置变量
+        API_ID="" API_HASH="" BOT_TOKEN=""
+        DOWNLOAD_ROOT="" ORGANIZE_BY_DATE="" PROGRESS_UPDATE_SEC="" ALLOWED_USERS=""
+        echo -e "\n${Y}  重新填写所有配置项...${N}\n"
+      }
       ;;
     n|no)
       echo -e "\n${Y}  已取消，您可以重新运行脚本填写配置。${N}"
       exit 0
       ;;
     *)
-      err "请输入 Y (确认) / n (取消) / m (修改单项)"
+      err "请输入 Y（确认）/ n（取消）/ m（修改单项）"
       ;;
   esac
 done
 
-# 输出确认成功日志（可选）
 ok "配置信息采集完成"
 
 # ═══════════════════════════════════════════════════════════════
@@ -475,8 +437,9 @@ sep
 
 ENV_FILE="$INSTALL_DIR/.env"
 if [[ -f "$ENV_FILE" ]]; then
-  cp "$ENV_FILE" "${ENV_FILE}.bak.$(date +%Y%m%d%H%M%S)"
-  info "已备份旧 .env"
+  local_bak="${ENV_FILE}.bak.$(date +%Y%m%d%H%M%S)"
+  cp "$ENV_FILE" "$local_bak"
+  info "已备份旧 .env → $local_bak"
 fi
 
 cat > "$ENV_FILE" << EOF
@@ -499,6 +462,7 @@ ok ".env 已写入 → $ENV_FILE（权限 600）"
 mkdir -p "$DOWNLOAD_ROOT"
 ok "下载目录已创建 → $DOWNLOAD_ROOT"
 
+# ── 生成 systemd 服务文件（仅 Linux）─────────────────────────
 if [[ "$OS" != "macos" && "$OS" != "unknown" ]]; then
   SERVICE_FILE="$INSTALL_DIR/tg-downloader.service"
   cat > "$SERVICE_FILE" << EOF
@@ -511,7 +475,7 @@ Wants=network-online.target
 Type=simple
 User=$(whoami)
 WorkingDirectory=${INSTALL_DIR}
-ExecStart=${VENV_DIR}/bin/python ${INSTALL_DIR}/bot.py
+ExecStart=${VENV_PYTHON} ${INSTALL_DIR}/bot.py
 Restart=on-failure
 RestartSec=5
 StandardOutput=journal
@@ -521,7 +485,7 @@ EnvironmentFile=${ENV_FILE}
 [Install]
 WantedBy=multi-user.target
 EOF
-  ok "systemd 服务文件已更新 → $SERVICE_FILE"
+  ok "systemd 服务文件已生成 → $SERVICE_FILE"
 fi
 
 # ═══════════════════════════════════════════════════════════════
@@ -529,14 +493,12 @@ fi
 # ═══════════════════════════════════════════════════════════════
 echo -e "\n${W}${BOLD}[5/5] 启动机器人${N}"
 sep
-
 echo -e "\n  ${G}${BOLD}✅ 安装完成！${N}\n"
 echo -e "  ${W}选择启动方式：${N}"
 echo -e "  ${C}1${N}  立即在前台运行（调试用，Ctrl+C 退出）"
 echo -e "  ${C}2${N}  后台运行（nohup，日志写入 bot.log）"
-if [[ "$OS" != "macos" && "$OS" != "unknown" ]]; then
+[[ "$OS" != "macos" && "$OS" != "unknown" ]] && \
   echo -e "  ${C}3${N}  注册为 systemd 服务（推荐生产环境）"
-fi
 echo -e "  ${C}q${N}  不启动，稍后手动运行\n"
 
 read -rp "  请选择 [1/2/3/q]: " LAUNCH_CHOICE
@@ -555,14 +517,14 @@ case "$LAUNCH_CHOICE" in
     if kill -0 "$BOT_PID" 2>/dev/null; then
       ok "Bot 已在后台运行，PID=$BOT_PID"
       info "查看日志：tail -f $INSTALL_DIR/bot.log"
-      info "停止 Bot：kill $BOT_PID"
+      info "停止 Bot ：kill $BOT_PID"
     else
       err "Bot 启动失败，请查看日志：cat $INSTALL_DIR/bot.log"
     fi
     ;;
   3)
     if [[ "$OS" == "macos" || "$OS" == "unknown" ]]; then
-      warn "当前系统不支持 systemd，请选择其他方式"
+      warn "当前系统不支持 systemd，请选择其他启动方式"
     else
       SERVICE_SRC="$INSTALL_DIR/tg-downloader.service"
       SERVICE_DST="/etc/systemd/system/tg-downloader.service"
@@ -577,7 +539,7 @@ case "$LAUNCH_CHOICE" in
         info "查看日志：journalctl -u tg-downloader -f"
         info "停止服务：sudo systemctl stop tg-downloader"
       else
-        err "服务启动失败"
+        err "服务启动失败，最近日志："
         $SUDO journalctl -u tg-downloader -n 20 --no-pager || true
       fi
     fi
