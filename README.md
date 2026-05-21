@@ -2,9 +2,13 @@
 chmod +x install.sh && ./install.sh
 
 https://my.telegram.org/apps
+
 git安装
+
 sudo apt install git-all
+
 git更新
+
 git clone git://git.kernel.org/pub/scm/git/git.git
 ## 一键安装
 
