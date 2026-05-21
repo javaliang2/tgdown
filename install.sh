@@ -154,41 +154,55 @@ if ! "$PYTHON" -m pip --version &>/dev/null; then
 fi
 ok "pip 可用"
 
-# 检测 venv 模块（智能匹配 Python 小版本）
-if ! "$PYTHON" -m venv --help &>/dev/null 2>&1; then
+# 检测 venv 模块
+ensure_venv() {
+  # 先尝试直接使用，成功就返回
+  if "$PYTHON" -m venv --help &>/dev/null 2>&1; then
+    ok "venv 模块可用"
+    return 0
+  fi
+
   warn "缺少 venv 模块，尝试自动安装..."
 
-  # 获取 Python 
-  PY_MAJOR_MINOR=$("$PYTHON" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+  # 获取 Python 主次版本号，例如 "3.11"
+  local py_ver
+  py_ver=$("$PYTHON" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+
   case "$OS" in
     debian)
-      warn "将安装 python${PY_MAJOR_MINOR}-venv ..."
+      warn "将安装 python${py_ver}-venv ..."
       $SUDO apt-get update -qq
-      $SUDO apt-get install -y "python${PY_MAJOR_MINOR}-venv" || true
+      $SUDO apt-get install -y "python${py_ver}-venv" || {
+        err "安装 python${py_ver}-venv 失败"
+        return 1
+      }
       ;;
     redhat)
-      # RHEL/CentOS
-      $SUDO yum reinstall -y python3 2>/dev/null || $SUDO dnf reinstall -y python3
+      # RHEL/CentOS 的 venv 通常包含在主 python3 包中，尝试重装
+      if command -v dnf &>/dev/null; then
+        $SUDO dnf reinstall -y python3
+      else
+        $SUDO yum reinstall -y python3
+      fi
       ;;
     arch)
-      # a
       warn "Arch 系统一般已包含 venv，请检查 python 包完整性"
       ;;
     macos)
-
       warn "请检查 Homebrew 安装的 Python 是否完整，可尝试 brew reinstall python3"
       ;;
     *)
-      warn "请手动安装 Python ${PY_MAJOR_MINOR} 的 venv 模块"
+      warn "请手动安装 Python ${py_ver} 的 venv 模块"
       ;;
   esac
 
-  # 安装后再次严格检查
-  if ! "$PYTHON" -m venv --help &>/dev/null 2>&1; then
-    die "venv 模块安装失败，请手动安装 python${PY_MAJOR_MINOR}-venv 或对应系统包"
+  # 安装后再次验证
+  if "$PYTHON" -m venv --help &>/dev/null 2>&1; then
+    ok "venv 模块可用"
+  else
+    die "venv 模块安装失败，请手动安装 python${py_ver}-venv 或对应系统包"
   fi
-fi
-ok "venv 模块可用"
+}
 
 check_network() {
   if command -v curl &>/dev/null; then
