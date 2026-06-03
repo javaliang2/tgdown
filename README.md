@@ -6,8 +6,8 @@ cd tgdown
 bash install.sh
 
 # 3️⃣ 脚本会引导你：
-#    ✅ 检测环境（OS、Python、Docker）
-#    ✅ 选择部署方式（Docker/Supervisor/Systemd/本地）
+#    ✅ 检测环境（OS、Python）
+#    ✅ 选择部署方式（Supervisor/Systemd/本地）
 #    ✅ 生成 .env 配置文件
 #    ✅ 安装依赖
 #    ✅ 启动 Bot
