@@ -96,7 +96,7 @@ find_python() {
 }
 
 if PYTHON=$(find_python); then
-  local py_ver=$("$PYTHON" -c "import sys; v=sys.version_info; print(f'{v.major}.{v.minor}.{v.micro}')")
+  py_ver=$("$PYTHON" -c "import sys; v=sys.version_info; print(f'{v.major}.{v.minor}.{v.micro}')")
   ok "Python $py_ver  ($PYTHON)"
 else
   die "Python 3.9+ 未找到，请先安装"
@@ -208,7 +208,6 @@ redirect_stderr=true
 stdout_logfile=$INSTALL_DIR/logs/supervisor.log
 stdout_logfile_maxbytes=50MB
 stdout_logfile_backups=10
-EnvironmentFile=$INSTALL_DIR/.env
 EOF
       
       if [[ $EUID -eq 0 ]] || command -v sudo &>/dev/null; then
