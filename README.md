@@ -12,12 +12,11 @@ bash install.sh
 #    ✅ 安装依赖
 #    ✅ 启动 Bot
 
-部署方式选择
+查看状态：sudo systemctl status tg-downloader
 
-1️⃣ Docker Compose      → 最简单，推荐新手
-2️⃣ Supervisor          → 生产级，推荐服务器
-3️⃣ Systemd             → Linux 系统，推荐开机自启
-4️⃣ 本地运行            → 开发测试，推荐调试
+查看日志：journalctl -u tg-downloader -f
+
+停止服务：sudo systemctl stop tg-downloader
 
 git安装
 
