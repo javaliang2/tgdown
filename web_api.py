@@ -4,7 +4,7 @@
 Web 界面后端 API 服务（增强版）
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 支持文件列表、搜索、在线播放等功能
-与 bot-enhanced.py 共享数据库
+支持浏览所有下载目录中的文件
 """
 
 import os
@@ -25,7 +25,7 @@ from web_streaming import register_streaming_routes
 
 # ══════════════════════════════════════════════════════════════
 #  初始化
-# ═══════════════════════════════════════���══════════════════════
+# ═══════════════════════════════════════════════════════���═══════
 load_dotenv()
 
 app = Flask(__name__, static_folder='web', static_url_path='')
@@ -95,6 +95,64 @@ def token_required(f):
     
     return decorated
 
+# ══════════════════════════════════════════════���═══════════════
+#  工具函数
+# ══════════════════════════════════════════════════════════════
+
+def get_media_type(file_path: Path) -> str:
+    """根据文件扩展名判断媒体类型"""
+    suffix = file_path.suffix.lower()
+    
+    # 视频格式
+    if suffix in ['.mp4', '.mkv', '.avi', '.mov', '.flv', '.wmv', '.webm']:
+        return 'video'
+    
+    # 音频格式
+    if suffix in ['.mp3', '.flac', '.wav', '.aac', '.ogg', '.m4a', '.wma']:
+        return 'audio'
+    
+    # 图片格式
+    if suffix in ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.svg']:
+        return 'photo'
+    
+    # 文档格式
+    if suffix in ['.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.txt']:
+        return 'document'
+    
+    return 'document'
+
+def scan_directory(dir_path: Path, limit: int = 500) -> list:
+    """扫描目录中的所有文件"""
+    files = []
+    
+    if not dir_path.exists():
+        return files
+    
+    try:
+        for file_path in dir_path.rglob('*'):
+            if file_path.is_file():
+                try:
+                    stat = file_path.stat()
+                    files.append({
+                        'id': hash(str(file_path)) & 0x7fffffff,  # 生成正整数 ID
+                        'file_name': file_path.name,
+                        'file_size': stat.st_size,
+                        'downloaded_at': datetime.fromtimestamp(stat.st_mtime).isoformat(),
+                        'media_type': get_media_type(file_path),
+                        'path': str(file_path)
+                    })
+                except Exception as e:
+                    print(f"⚠️  扫描文件失败 {file_path}: {e}")
+                
+                if len(files) >= limit:
+                    break
+    except Exception as e:
+        print(f"❌ 扫描目录失败 {dir_path}: {e}")
+    
+    # 按修改时间排序
+    files.sort(key=lambda x: x['downloaded_at'], reverse=True)
+    return files
+
 # ══════════════════════════════════════════════════════════════
 #  数据库操作
 # ══════════════════════════════════════════════════════════════
@@ -106,83 +164,112 @@ def get_db():
     return conn
 
 def list_files_for_type(media_type: str, limit: int = 100) -> list:
-    """获取指定类型的文件列表"""
-    if not DB_PATH.exists():
-        return []
+    """获取指定类型的文件列表（优先数据库，然后扫描目录）"""
+    files = []
     
-    try:
-        conn = get_db()
-        rows = conn.execute(
-            """SELECT id, file_name, file_size, downloaded_at, media_type, path 
-               FROM files WHERE media_type = ?
-               ORDER BY downloaded_at DESC LIMIT ?""",
-            (media_type, limit)
-        ).fetchall()
-        conn.close()
-        return [dict(row) for row in rows]
-    except Exception as e:
-        print(f"Database error: {e}")
-        return []
+    # 首先尝试从数据库获取
+    if DB_PATH.exists():
+        try:
+            conn = get_db()
+            rows = conn.execute(
+                """SELECT id, file_name, file_size, downloaded_at, media_type, path 
+                   FROM files WHERE media_type = ?
+                   ORDER BY downloaded_at DESC LIMIT ?""",
+                (media_type, limit)
+            ).fetchall()
+            conn.close()
+            files = [dict(row) for row in rows]
+        except Exception as e:
+            print(f"⚠️  数据库查询失败: {e}")
+    
+    # 如果数据库为空，扫描目录
+    if not files:
+        all_files = scan_directory(DOWNLOAD_ROOT, limit)
+        if media_type != 'all':
+            files = [f for f in all_files if f['media_type'] == media_type]
+        else:
+            files = all_files
+    
+    return files
 
 def search_files(keyword: str, limit: int = 50) -> list:
-    """搜索文件"""
-    if not DB_PATH.exists():
-        return []
+    """搜索文件（优先数据库，然后扫描目录）"""
+    files = []
     
-    try:
-        conn = get_db()
-        rows = conn.execute(
-            """SELECT id, file_name, file_size, downloaded_at, media_type, path 
-               FROM files WHERE file_name LIKE ?
-               ORDER BY downloaded_at DESC LIMIT ?""",
-            (f"%{keyword}%", limit)
-        ).fetchall()
-        conn.close()
-        return [dict(row) for row in rows]
-    except Exception as e:
-        print(f"Database error: {e}")
-        return []
+    # 首先尝试从数据库搜索
+    if DB_PATH.exists():
+        try:
+            conn = get_db()
+            rows = conn.execute(
+                """SELECT id, file_name, file_size, downloaded_at, media_type, path 
+                   FROM files WHERE file_name LIKE ?
+                   ORDER BY downloaded_at DESC LIMIT ?""",
+                (f"%{keyword}%", limit)
+            ).fetchall()
+            conn.close()
+            files = [dict(row) for row in rows]
+        except Exception as e:
+            print(f"⚠️  数据库查询失败: {e}")
+    
+    # 如果数据库结果不足，扫描目录补充
+    if len(files) < limit:
+        all_files = scan_directory(DOWNLOAD_ROOT, limit)
+        for f in all_files:
+            if keyword.lower() in f['file_name'].lower():
+                # 避免重复
+                if not any(x['path'] == f['path'] for x in files):
+                    files.append(f)
+                if len(files) >= limit:
+                    break
+    
+    return files[:limit]
 
 def get_all_stats() -> dict:
     """获取统计信息"""
-    if not DB_PATH.exists():
-        return {
-            'total_files': 0,
-            'total_size': 0,
-            'by_type': {}
-        }
+    stats = {
+        'total_files': 0,
+        'total_size': 0,
+        'by_type': {}
+    }
     
     try:
-        conn = get_db()
-        # 总数和总大小
-        row = conn.execute(
-            "SELECT COUNT(*) as cnt, SUM(file_size) as total FROM files"
-        ).fetchone()
-        total_files = row['cnt'] or 0
-        total_size = row['total'] or 0
+        # 优先从数据库获取
+        if DB_PATH.exists():
+            conn = get_db()
+            row = conn.execute(
+                "SELECT COUNT(*) as cnt, SUM(file_size) as total FROM files"
+            ).fetchone()
+            stats['total_files'] = row['cnt'] or 0
+            stats['total_size'] = row['total'] or 0
+            
+            rows = conn.execute(
+                "SELECT media_type, COUNT(*) as cnt, SUM(file_size) as size FROM files GROUP BY media_type"
+            ).fetchall()
+            
+            for row in rows:
+                stats['by_type'][row['media_type']] = {
+                    'count': row['cnt'],
+                    'size': row['size']
+                }
+            conn.close()
         
-        # 按类型统计
-        rows = conn.execute(
-            "SELECT media_type, COUNT(*) as cnt, SUM(file_size) as size FROM files GROUP BY media_type"
-        ).fetchall()
-        
-        by_type = {}
-        for row in rows:
-            by_type[row['media_type']] = {
-                'count': row['cnt'],
-                'size': row['size']
-            }
-        
-        conn.close()
-        
-        return {
-            'total_files': total_files,
-            'total_size': total_size,
-            'by_type': by_type
-        }
+        # 如果数据库为空，扫描目录
+        if stats['total_files'] == 0:
+            all_files = scan_directory(DOWNLOAD_ROOT, limit=10000)
+            stats['total_files'] = len(all_files)
+            stats['total_size'] = sum(f['file_size'] for f in all_files)
+            
+            for f in all_files:
+                media_type = f['media_type']
+                if media_type not in stats['by_type']:
+                    stats['by_type'][media_type] = {'count': 0, 'size': 0}
+                stats['by_type'][media_type]['count'] += 1
+                stats['by_type'][media_type]['size'] += f['file_size']
+    
     except Exception as e:
-        print(f"Database error: {e}")
-        return {'total_files': 0, 'total_size': 0, 'by_type': {}}
+        print(f"❌ 获取统计失败: {e}")
+    
+    return stats
 
 # ══════════════════════════════════════════════════════════════
 #  API 路由
@@ -382,7 +469,7 @@ def health():
 
 # ══════════════════════════════════════════════════════════════
 #  错误处理
-# ═════════════════════════════════════════════���════════════════
+# ══════════════════════════════════════════════════════════════
 
 @app.errorhandler(404)
 def not_found(error):
@@ -409,6 +496,7 @@ if __name__ == '__main__':
     print(f"🌐 Web 服务启动：http://localhost:{port}")
     print(f"🔐 请使用 .env 中的 WEB_PASSWORD 登录")
     print(f"🎬 播放器：http://localhost:{port}/player?id=<file_id>&token=<token>")
+    print(f"📁 扫描目录：{DOWNLOAD_ROOT}")
     
     app.run(
         host='0.0.0.0',
