@@ -1,0 +1,1 @@
+# 📦 Web 界面依赖（添加到 requirements-enhanced.txt）\n\n# 已有的依赖\npyrogram==2.0.106\nTgCrypto==1.2.5\npython-dotenv==1.0.1\npsutil==5.9.6\n\n# 【NEW】Web 界面依赖\nFlask==2.3.3\nFlask-CORS==4.0.0\nPyJWT==2.8.0\n
