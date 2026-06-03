@@ -1,37 +1,38 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Telegram 自动下载机器人 · Pyrogram 版  v2.0
+Telegram 自动下载机器人 · Pyrogram 版  v3.0
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ✅ MTProto 协议 — 无文件大小限制
 ✅ 实时进度条（速度 / 剩余时间）
 ✅ 8 种媒体类型自动分类保存
-✅ 内联按钮管理菜单（无需输入命令）
+✅ 内联按钮管理菜单
 ✅ 按日期子目录归档
 ✅ 用户白名单
 ✅ 并发下载
-✅ 从 .env 读取配置
-✅ 文件浏览器（分页浏览每种类型）  ← NEW
-✅ 单文件删除（含二次确认）        ← NEW
-✅ 批量删除（按类型 / 按日期）      ← NEW
-✅ 文件详情（大小 / 路径 / 时间）   ← NEW
+✅ 文件浏览器（分页）
+✅ 单文件 / 批量删除（二次确认）
+✅ 文件详情
+✅ SQLite 持久化注册表（重启不丢失）← NEW v3
+✅ 文件回传（发回 Telegram）        ← NEW v3
+✅ 文件名模糊搜索（/search）         ← NEW v3
 """
 
-import asyncio
 import logging
 import os
-import shutil
+import sqlite3
 import time
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
 from pyrogram import Client, filters
 from pyrogram.types import (
-    Message,
     CallbackQuery,
-    InlineKeyboardMarkup,
     InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
 )
 
 # ══════════════════════════════════════════════
@@ -59,7 +60,8 @@ BOT_TOKEN = _require("BOT_TOKEN")
 DOWNLOAD_ROOT       = Path(os.getenv("DOWNLOAD_ROOT", "./downloads"))
 ORGANIZE_BY_DATE    = os.getenv("ORGANIZE_BY_DATE", "true").lower() == "true"
 PROGRESS_UPDATE_SEC = float(os.getenv("PROGRESS_UPDATE_SEC", "2.0"))
-PAGE_SIZE           = int(os.getenv("PAGE_SIZE", "8"))          # 文件浏览每页条数
+PAGE_SIZE           = int(os.getenv("PAGE_SIZE", "8"))
+DB_PATH             = Path(os.getenv("DB_PATH", "./tg_downloader.db"))
 ALLOWED_USERS: list[int] = [
     int(x) for x in os.getenv("ALLOWED_USERS", "").split(",") if x.strip().isdigit()
 ]
@@ -81,31 +83,112 @@ MEDIA_DIRS: dict[str, Path] = {
 ENABLED_TYPES: dict[str, bool] = {k: True for k in MEDIA_DIRS}
 
 # ══════════════════════════════════════════════
-#  文件注册表（路径 ↔ 短ID，规避 callback 64B 限制）
+#  SQLite 持久化层
 # ══════════════════════════════════════════════
-# { fid(int): Path }
-_FILE_REGISTRY: dict[int, Path] = {}
-_fid_counter = 0
-_PATH_TO_FID: dict[str, int] = {}   # 反向索引，避免重复注册
+#
+#  表结构：
+#    files(id, path, media_type, file_name,
+#          file_size, downloaded_at, downloaded_by)
+#
+#  内存缓存 _FILE_REGISTRY / _PATH_TO_FID 在启动时从 DB 重建，
+#  之后随每次下载/删除实时更新，确保重启后 fid 按钮仍可用。
 
-def _register_path(p: Path) -> int:
-    """注册路径，返回短整型 ID（幂等）"""
-    global _fid_counter
-    key = str(p.resolve())
+_FILE_REGISTRY: dict[int, Path] = {}   # fid → Path
+_PATH_TO_FID:   dict[str, int]  = {}   # resolved_str → fid
+
+@contextmanager
+def _db():
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
+
+def db_init():
+    """建表（幂等）"""
+    with _db() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS files (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                path          TEXT    UNIQUE NOT NULL,
+                media_type    TEXT    NOT NULL,
+                file_name     TEXT    NOT NULL,
+                file_size     INTEGER NOT NULL DEFAULT 0,
+                downloaded_at TEXT    NOT NULL,
+                downloaded_by INTEGER
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_media_type ON files(media_type)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_file_name  ON files(file_name)")
+
+def db_load_registry():
+    """启动时将 DB 中仍存在的文件加载进内存注册表"""
+    with _db() as conn:
+        rows = conn.execute("SELECT id, path FROM files").fetchall()
+    stale = []
+    for row in rows:
+        fid, raw = row["id"], row["path"]
+        p = Path(raw)
+        if p.exists():
+            _FILE_REGISTRY[fid] = p
+            _PATH_TO_FID[str(p.resolve())] = fid
+        else:
+            stale.append(fid)
+    if stale:
+        with _db() as conn:
+            conn.executemany("DELETE FROM files WHERE id=?", [(i,) for i in stale])
+
+def db_register(path: Path, media_type: str, uid: int | None) -> int:
+    """注册文件（幂等），返回 fid"""
+    key = str(path.resolve())
     if key in _PATH_TO_FID:
         return _PATH_TO_FID[key]
-    _fid_counter += 1
-    _FILE_REGISTRY[_fid_counter] = p
-    _PATH_TO_FID[key] = _fid_counter
-    return _fid_counter
+    stat = path.stat()
+    with _db() as conn:
+        conn.execute(
+            """INSERT INTO files(path,media_type,file_name,file_size,downloaded_at,downloaded_by)
+               VALUES(?,?,?,?,?,?)
+               ON CONFLICT(path) DO UPDATE SET
+                 file_size=excluded.file_size,
+                 downloaded_at=excluded.downloaded_at""",
+            (key, media_type, path.name, stat.st_size,
+             datetime.now().strftime("%Y-%m-%d %H:%M:%S"), uid),
+        )
+        fid = conn.execute("SELECT id FROM files WHERE path=?", (key,)).fetchone()["id"]
+    _FILE_REGISTRY[fid] = path
+    _PATH_TO_FID[key]   = fid
+    return fid
+
+def db_unregister(fid: int):
+    """从 DB + 内存移除"""
+    p = _FILE_REGISTRY.pop(fid, None)
+    if p:
+        _PATH_TO_FID.pop(str(p.resolve()), None)
+    with _db() as conn:
+        conn.execute("DELETE FROM files WHERE id=?", (fid,))
+
+def db_search(keyword: str, limit: int = 50) -> list:
+    with _db() as conn:
+        return conn.execute(
+            "SELECT * FROM files WHERE file_name LIKE ? ORDER BY downloaded_at DESC LIMIT ?",
+            (f"%{keyword}%", limit),
+        ).fetchall()
+
+def db_get_row(fid: int):
+    with _db() as conn:
+        return conn.execute("SELECT * FROM files WHERE id=?", (fid,)).fetchone()
+
+# 兼容旧接口
+def _register_path(p: Path, media_type: str = "document", uid: int | None = None) -> int:
+    return db_register(p, media_type, uid)
 
 def _lookup_path(fid: int) -> Path | None:
     return _FILE_REGISTRY.get(fid)
 
 def _unregister_path(fid: int):
-    p = _FILE_REGISTRY.pop(fid, None)
-    if p:
-        _PATH_TO_FID.pop(str(p.resolve()), None)
+    db_unregister(fid)
 
 # ══════════════════════════════════════════════
 #  日志
@@ -133,19 +216,18 @@ bot = Client(
 
 def fmt_size(n: int) -> str:
     if n < 1024:     return f"{n} B"
-    if n < 1 << 20:  return f"{n / 1024:.1f} KB"
-    if n < 1 << 30:  return f"{n / (1 << 20):.1f} MB"
-    return f"{n / (1 << 30):.2f} GB"
+    if n < 1 << 20:  return f"{n/1024:.1f} KB"
+    if n < 1 << 30:  return f"{n/(1<<20):.1f} MB"
+    return f"{n/(1<<30):.2f} GB"
 
 def fmt_speed(bps: float) -> str:
     if bps < 1024:    return f"{bps:.0f} B/s"
-    if bps < 1 << 20: return f"{bps / 1024:.1f} KB/s"
-    return f"{bps / (1 << 20):.1f} MB/s"
+    if bps < 1 << 20: return f"{bps/1024:.1f} KB/s"
+    return f"{bps/(1<<20):.1f} MB/s"
 
 def fmt_eta(sec: float) -> str:
     sec = max(0, int(sec))
-    h, rem = divmod(sec, 3600)
-    m, s   = divmod(rem, 60)
+    h, r = divmod(sec, 3600); m, s = divmod(r, 60)
     if h: return f"{h}h {m:02d}m"
     if m: return f"{m}m {s:02d}s"
     return f"{s}s"
@@ -154,15 +236,12 @@ def fmt_ts(ts: float) -> str:
     return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
 
 def pbar(pct: float, width: int = 16) -> str:
-    filled = int(width * pct / 100)
-    return "█" * filled + "░" * (width - filled)
+    f = int(width * pct / 100)
+    return "█" * f + "░" * (width - f)
 
 def media_emoji(t: str) -> str:
-    return {
-        "photo": "🖼️", "video": "🎬", "audio": "🎵",
-        "voice": "🎤", "document": "📄", "sticker": "😄",
-        "animation": "🎞️", "video_note": "📹",
-    }.get(t, "📁")
+    return {"photo":"🖼️","video":"🎬","audio":"🎵","voice":"🎤",
+            "document":"📄","sticker":"😄","animation":"🎞️","video_note":"📹"}.get(t,"📁")
 
 def get_save_dir(media_type: str) -> Path:
     base = MEDIA_DIRS.get(media_type, DOWNLOAD_ROOT / "others")
@@ -179,23 +258,22 @@ def safe_path(save_dir: Path, name: str) -> Path:
     return p
 
 def is_allowed(uid: int | None) -> bool:
-    if uid is None:
-        return True
+    if uid is None: return True
     return not ALLOWED_USERS or uid in ALLOWED_USERS
 
 def detect_media(msg: Message) -> tuple[str, str] | tuple[None, None]:
     mid = msg.id
-    if msg.photo:        return "photo",      f"photo_{mid}.jpg"
-    if msg.video:        return "video",       msg.video.file_name      or f"video_{mid}.mp4"
-    if msg.audio:        return "audio",       msg.audio.file_name      or f"audio_{mid}.mp3"
-    if msg.voice:        return "voice",       f"voice_{mid}.ogg"
-    if msg.document:     return "document",    msg.document.file_name   or f"document_{mid}"
+    if msg.photo:      return "photo",     f"photo_{mid}.jpg"
+    if msg.video:      return "video",      msg.video.file_name     or f"video_{mid}.mp4"
+    if msg.audio:      return "audio",      msg.audio.file_name     or f"audio_{mid}.mp3"
+    if msg.voice:      return "voice",      f"voice_{mid}.ogg"
+    if msg.document:   return "document",   msg.document.file_name  or f"document_{mid}"
     if msg.sticker:
-        s   = msg.sticker
+        s = msg.sticker
         ext = ".webm" if s.is_video else (".tgs" if s.is_animated else ".webp")
         return "sticker", f"sticker_{mid}{ext}"
-    if msg.animation:    return "animation",   msg.animation.file_name  or f"animation_{mid}.mp4"
-    if msg.video_note:   return "video_note",  f"videonote_{mid}.mp4"
+    if msg.animation:  return "animation",  msg.animation.file_name or f"animation_{mid}.mp4"
+    if msg.video_note: return "video_note", f"videonote_{mid}.mp4"
     return None, None
 
 def get_file_size(msg: Message) -> int:
@@ -210,45 +288,26 @@ def get_file_size(msg: Message) -> int:
 # ══════════════════════════════════════════════
 
 def list_files_for_type(mtype: str) -> list[Path]:
-    """返回该类型目录下所有文件，按修改时间倒序"""
     base = MEDIA_DIRS.get(mtype)
     if not base or not base.exists():
         return []
-    files = sorted(
+    return sorted(
         (f for f in base.rglob("*") if f.is_file()),
-        key=lambda f: f.stat().st_mtime,
-        reverse=True,
+        key=lambda f: f.stat().st_mtime, reverse=True,
     )
-    return files
-
-def list_dates_for_type(mtype: str) -> list[str]:
-    """返回该类型目录下存在的日期子目录名（倒序）"""
-    base = MEDIA_DIRS.get(mtype)
-    if not base or not base.exists():
-        return []
-    dates = sorted(
-        (d.name for d in base.iterdir() if d.is_dir()),
-        reverse=True,
-    )
-    return dates
 
 # ══════════════════════════════════════════════
-#  统计数据
+#  统计
 # ══════════════════════════════════════════════
 
 def calc_stats() -> tuple[dict, int, int]:
-    per = {}
-    tf = ts = 0
+    per = {}; tf = ts = 0
     for mtype, base in MEDIA_DIRS.items():
         if not base.exists():
-            per[mtype] = (0, 0)
-            continue
+            per[mtype] = (0, 0); continue
         files = [f for f in base.rglob("*") if f.is_file()]
-        cnt   = len(files)
-        size  = sum(f.stat().st_size for f in files)
-        per[mtype] = (cnt, size)
-        tf += cnt
-        ts += size
+        cnt = len(files); size = sum(f.stat().st_size for f in files)
+        per[mtype] = (cnt, size); tf += cnt; ts += size
     return per, tf, ts
 
 # ══════════════════════════════════════════════
@@ -257,138 +316,130 @@ def calc_stats() -> tuple[dict, int, int]:
 
 def kb_main() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("📊 下载统计",  callback_data="menu:status"),
-            InlineKeyboardButton("📁 目录结构",  callback_data="menu:dirs"),
-        ],
-        [
-            InlineKeyboardButton("🔍 浏览文件",  callback_data="menu:browse"),
-            InlineKeyboardButton("🗑️ 删除文件",  callback_data="menu:delete"),
-        ],
-        [
-            InlineKeyboardButton("🔧 类型开关",  callback_data="menu:types"),
-            InlineKeyboardButton("⚙️ 当前设置",  callback_data="menu:settings"),
-        ],
-        [
-            InlineKeyboardButton("🔄 刷新菜单",  callback_data="menu:home"),
-        ],
+        [InlineKeyboardButton("📊 下载统计", callback_data="menu:status"),
+         InlineKeyboardButton("📁 目录结构", callback_data="menu:dirs")],
+        [InlineKeyboardButton("🔍 浏览文件", callback_data="menu:browse"),
+         InlineKeyboardButton("🗑️ 删除文件", callback_data="menu:delete")],
+        [InlineKeyboardButton("🔧 类型开关", callback_data="menu:types"),
+         InlineKeyboardButton("⚙️ 当前设置", callback_data="menu:settings")],
+        [InlineKeyboardButton("🔄 刷新菜单", callback_data="menu:home")],
     ])
 
 def kb_back(target: str = "menu:home") -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("« 返回", callback_data=target)]
-    ])
+    return InlineKeyboardMarkup([[InlineKeyboardButton("« 返回", callback_data=target)]])
 
 def kb_types() -> InlineKeyboardMarkup:
     rows = []
-    items = list(MEDIA_DIRS.keys())
-    for i in range(0, len(items), 2):
+    for i in range(0, len(MEDIA_DIRS), 2):
         row = []
-        for mtype in items[i:i+2]:
-            flag  = "✅" if ENABLED_TYPES[mtype] else "❌"
-            label = f"{flag} {media_emoji(mtype)} {mtype}"
-            row.append(InlineKeyboardButton(label, callback_data=f"toggle:{mtype}"))
+        for mtype in list(MEDIA_DIRS)[i:i+2]:
+            flag = "✅" if ENABLED_TYPES[mtype] else "❌"
+            row.append(InlineKeyboardButton(f"{flag} {media_emoji(mtype)} {mtype}",
+                                            callback_data=f"toggle:{mtype}"))
         rows.append(row)
     rows.append([InlineKeyboardButton("« 返回主菜单", callback_data="menu:home")])
     return InlineKeyboardMarkup(rows)
 
 def kb_type_select(prefix: str, back: str = "menu:home") -> InlineKeyboardMarkup:
-    """通用：选择媒体类型的键盘（用于浏览/删除入口）"""
-    rows = []
-    items = list(MEDIA_DIRS.keys())
-    for i in range(0, len(items), 2):
+    per, _, _ = calc_stats(); rows = []
+    for i in range(0, len(MEDIA_DIRS), 2):
         row = []
-        for mtype in items[i:i+2]:
-            per, _, _ = calc_stats()
-            cnt = per.get(mtype, (0, 0))[0]
-            label = f"{media_emoji(mtype)} {mtype} ({cnt})"
-            row.append(InlineKeyboardButton(label, callback_data=f"{prefix}:{mtype}:0"))
+        for mtype in list(MEDIA_DIRS)[i:i+2]:
+            cnt = per.get(mtype, (0,))[0]
+            row.append(InlineKeyboardButton(
+                f"{media_emoji(mtype)} {mtype} ({cnt})",
+                callback_data=f"{prefix}:{mtype}:0"))
         rows.append(row)
     rows.append([InlineKeyboardButton("« 返回主菜单", callback_data=back)])
     return InlineKeyboardMarkup(rows)
 
 def kb_file_list(mtype: str, page: int, files: list[Path]) -> InlineKeyboardMarkup:
-    """分页文件列表键盘"""
-    total   = len(files)
-    total_p = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
-    start   = page * PAGE_SIZE
-    end     = min(start + PAGE_SIZE, total)
-    page_files = files[start:end]
-
+    total_p = max(1, (len(files) + PAGE_SIZE - 1) // PAGE_SIZE)
     rows = []
-    for f in page_files:
-        fid   = _register_path(f)
-        label = f"📄 {f.name[:38]}"
-        rows.append([InlineKeyboardButton(label, callback_data=f"finfo:{fid}")])
-
-    # 翻页
+    for f in files[page * PAGE_SIZE:(page + 1) * PAGE_SIZE]:
+        fid = _register_path(f, mtype)
+        rows.append([InlineKeyboardButton(f"📄 {f.name[:38]}", callback_data=f"finfo:{fid}")])
     nav = []
     if page > 0:
         nav.append(InlineKeyboardButton("◀ 上一页", callback_data=f"browse:{mtype}:{page-1}"))
     nav.append(InlineKeyboardButton(f"{page+1}/{total_p}", callback_data="noop"))
     if page < total_p - 1:
         nav.append(InlineKeyboardButton("下一页 ▶", callback_data=f"browse:{mtype}:{page+1}"))
-    if nav:
-        rows.append(nav)
-
+    rows.append(nav)
     rows.append([
         InlineKeyboardButton("« 返回类型列表", callback_data="menu:browse"),
         InlineKeyboardButton("🏠 主菜单",      callback_data="menu:home"),
     ])
     return InlineKeyboardMarkup(rows)
 
-def kb_file_info(fid: int, mtype: str, page: int) -> InlineKeyboardMarkup:
+def kb_file_info(fid: int, mtype: str, page: int,
+                 back_search: str | None = None) -> InlineKeyboardMarkup:
+    back_cb = f"search_back:{back_search}" if back_search else f"browse:{mtype}:{page}"
     return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("🗑️ 删除此文件",  callback_data=f"fdel_ask:{fid}:{mtype}:{page}"),
-        ],
-        [
-            InlineKeyboardButton("« 返回列表",    callback_data=f"browse:{mtype}:{page}"),
-            InlineKeyboardButton("🏠 主菜单",     callback_data="menu:home"),
-        ],
+        [InlineKeyboardButton("📤 回传文件", callback_data=f"fsend:{fid}"),
+         InlineKeyboardButton("🗑️ 删除文件", callback_data=f"fdel_ask:{fid}:{mtype}:{page}")],
+        [InlineKeyboardButton("« 返回列表",  callback_data=back_cb),
+         InlineKeyboardButton("🏠 主菜单",   callback_data="menu:home")],
     ])
 
 def kb_file_del_confirm(fid: int, mtype: str, page: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("⚠️ 确认删除",   callback_data=f"fdel_do:{fid}:{mtype}:{page}"),
-            InlineKeyboardButton("✗ 取消",        callback_data=f"finfo:{fid}"),
-        ],
-    ])
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("⚠️ 确认删除", callback_data=f"fdel_do:{fid}:{mtype}:{page}"),
+        InlineKeyboardButton("✗ 取消",      callback_data=f"finfo:{fid}"),
+    ]])
 
-def kb_batch_type_select(back: str = "menu:delete") -> InlineKeyboardMarkup:
-    """删除入口：选择类型 + 全部删除"""
-    rows = []
-    items = list(MEDIA_DIRS.keys())
-    for i in range(0, len(items), 2):
+def kb_batch_type_select() -> InlineKeyboardMarkup:
+    per, _, _ = calc_stats(); rows = []
+    for i in range(0, len(MEDIA_DIRS), 2):
         row = []
-        for mtype in items[i:i+2]:
-            per, _, _ = calc_stats()
-            cnt = per.get(mtype, (0, 0))[0]
-            label = f"{media_emoji(mtype)} {mtype} ({cnt})"
-            row.append(InlineKeyboardButton(label, callback_data=f"bdel_ask:{mtype}"))
+        for mtype in list(MEDIA_DIRS)[i:i+2]:
+            cnt = per.get(mtype, (0,))[0]
+            row.append(InlineKeyboardButton(
+                f"{media_emoji(mtype)} {mtype} ({cnt})",
+                callback_data=f"bdel_ask:{mtype}"))
         rows.append(row)
     rows.append([
-        InlineKeyboardButton("💣 删除全部",   callback_data="bdel_ask:ALL"),
+        InlineKeyboardButton("💣 删除全部",  callback_data="bdel_ask:ALL"),
         InlineKeyboardButton("« 返回主菜单", callback_data="menu:home"),
     ])
     return InlineKeyboardMarkup(rows)
 
 def kb_batch_del_confirm(mtype: str) -> InlineKeyboardMarkup:
     label = "全部" if mtype == "ALL" else mtype
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(f"⚠️ 确认删除 {label}", callback_data=f"bdel_do:{mtype}"),
-            InlineKeyboardButton("✗ 取消",               callback_data="menu:delete"),
-        ],
-    ])
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(f"⚠️ 确认删除 {label}", callback_data=f"bdel_do:{mtype}"),
+        InlineKeyboardButton("✗ 取消",               callback_data="menu:delete"),
+    ]])
+
+def kb_search_results(rows: list, keyword: str, page: int) -> InlineKeyboardMarkup:
+    total_p = max(1, (len(rows) + PAGE_SIZE - 1) // PAGE_SIZE)
+    result = []
+    for row in rows[page * PAGE_SIZE:(page + 1) * PAGE_SIZE]:
+        fid = row["id"]
+        p   = Path(row["path"])
+        # 补充内存缓存（DB 行可能在重启前注册）
+        if fid not in _FILE_REGISTRY and p.exists():
+            _FILE_REGISTRY[fid] = p
+            _PATH_TO_FID[str(p.resolve())] = fid
+        label = f"{media_emoji(row['media_type'])} {row['file_name'][:36]}"
+        result.append([InlineKeyboardButton(
+            label, callback_data=f"finfo_s:{fid}:{keyword[:20]}")])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("◀", callback_data=f"search:{keyword}:{page-1}"))
+    nav.append(InlineKeyboardButton(f"{page+1}/{total_p}", callback_data="noop"))
+    if page < total_p - 1:
+        nav.append(InlineKeyboardButton("▶", callback_data=f"search:{keyword}:{page+1}"))
+    result.append(nav)
+    result.append([InlineKeyboardButton("🏠 主菜单", callback_data="menu:home")])
+    return InlineKeyboardMarkup(result)
 
 # ══════════════════════════════════════════════
-#  菜单文本构建
+#  文本构建
 # ══════════════════════════════════════════════
 
 def text_home(name: str) -> str:
-    enabled   = sum(1 for v in ENABLED_TYPES.values() if v)
+    enabled = sum(1 for v in ENABLED_TYPES.values() if v)
     _, tf, ts = calc_stats()
     return (
         f"👋 你好，**{name}**！\n\n"
@@ -397,7 +448,8 @@ def text_home(name: str) -> str:
         f"🗂️ 已保存文件：**{tf}** 个  ({fmt_size(ts)})\n"
         f"🔛 启用类型：**{enabled}** / {len(MEDIA_DIRS)}\n"
         f"📂 根目录：`{DOWNLOAD_ROOT.resolve()}`\n\n"
-        f"直接发送或转发媒体给我，自动保存 👇"
+        f"直接发送或转发媒体给我，自动保存 👇\n"
+        f"🔍 搜索文件：`/search 关键词`"
     )
 
 def text_status() -> str:
@@ -408,27 +460,24 @@ def text_status() -> str:
         bar  = "▓" * min(cnt // max(1, tf // 10 + 1), 8) if tf else ""
         lines.append(f"  {flag} {media_emoji(mtype)} **{mtype}**：{cnt} 个  {fmt_size(size)}  {bar}")
     lines.append(f"\n📦 **合计**：{tf} 个文件，{fmt_size(ts)}")
-    lines.append(f"\n🕐 更新时间：{datetime.now().strftime('%H:%M:%S')}")
+    lines.append(f"🕐 更新时间：{datetime.now().strftime('%H:%M:%S')}")
     return "\n".join(lines)
 
 def text_dirs() -> str:
     lines = [f"📁 **目录结构**\n`{DOWNLOAD_ROOT.resolve()}`\n"]
     for mtype, path in MEDIA_DIRS.items():
         exists = path.exists()
-        mark   = "✅" if exists else "⬜"
         cnt    = len([f for f in path.rglob("*") if f.is_file()]) if exists else 0
-        flag   = "▶" if ENABLED_TYPES[mtype] else "⏸"
         lines.append(
-            f"  {mark}{flag} {media_emoji(mtype)} "
-            f"`{path.relative_to(DOWNLOAD_ROOT)}`  _{cnt} 个_"
+            f"  {'✅' if exists else '⬜'}{'▶' if ENABLED_TYPES[mtype] else '⏸'} "
+            f"{media_emoji(mtype)} `{path.relative_to(DOWNLOAD_ROOT)}`  _{cnt} 个_"
         )
     return "\n".join(lines)
 
 def text_types() -> str:
     lines = ["🔧 **媒体类型开关**\n点击按钮切换启用 / 停用\n"]
     for mtype, enabled in ENABLED_TYPES.items():
-        state = "✅ 启用" if enabled else "❌ 停用"
-        lines.append(f"  {media_emoji(mtype)} {mtype}：{state}")
+        lines.append(f"  {media_emoji(mtype)} {mtype}：{'✅ 启用' if enabled else '❌ 停用'}")
     return "\n".join(lines)
 
 def text_settings() -> str:
@@ -437,17 +486,17 @@ def text_settings() -> str:
     return (
         "⚙️ **当前运行设置**\n\n"
         f"📂 下载根目录\n`{DOWNLOAD_ROOT.resolve()}`\n\n"
+        f"💾 数据库路径\n`{DB_PATH.resolve()}`\n\n"
         f"📅 按日期归档：{'✅ 开启' if ORGANIZE_BY_DATE else '❌ 关闭'}\n"
         f"⏱ 进度刷新间隔：{PROGRESS_UPDATE_SEC}s\n"
-        f"📋 文件浏览每页：{PAGE_SIZE} 条\n"
+        f"📋 每页条数：{PAGE_SIZE}\n"
         f"👤 白名单：{wl}\n\n"
-        f"🔛 启用的类型：\n"
-        + "  " + "  ".join(media_emoji(t) for t in enabled_list)
+        f"🔛 启用类型：{'  '.join(media_emoji(t) for t in enabled_list)}"
     )
 
 def text_browse_select() -> str:
     per, tf, ts = calc_stats()
-    lines = [f"🔍 **浏览文件**  共 {tf} 个 / {fmt_size(ts)}\n\n选择要浏览的媒体类型："]
+    lines = [f"🔍 **浏览文件**  共 {tf} 个 / {fmt_size(ts)}\n\n选择媒体类型："]
     for mtype, (cnt, size) in per.items():
         lines.append(f"  {media_emoji(mtype)} **{mtype}**：{cnt} 个  {fmt_size(size)}")
     return "\n".join(lines)
@@ -456,16 +505,16 @@ def text_file_list(mtype: str, page: int, files: list[Path]) -> str:
     total   = len(files)
     total_p = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
     start   = page * PAGE_SIZE
-    end     = min(start + PAGE_SIZE, total)
-    lines   = [
-        f"{media_emoji(mtype)} **{mtype}** 文件列表",
-        f"共 {total} 个文件  第 {page+1}/{total_p} 页\n",
-    ]
-    for i, f in enumerate(files[start:end], start=start+1):
-        stat  = f.stat()
-        mtime = fmt_ts(stat.st_mtime)[:10]
-        lines.append(f"  `{i}.` {f.name[:36]}  _{fmt_size(stat.st_size)}_  {mtime}")
-    lines.append("\n点击文件名查看详情 / 删除")
+    lines   = [f"{media_emoji(mtype)} **{mtype}** 文件列表",
+               f"共 {total} 个  第 {page+1}/{total_p} 页\n"]
+    for i, f in enumerate(files[start:start + PAGE_SIZE], start=start + 1):
+        stat = f.stat()
+        lines.append(
+            f"  `{i}.` {f.name[:36]}  "
+            f"_{fmt_size(stat.st_size)}_  "
+            f"{fmt_ts(stat.st_mtime)[:10]}"
+        )
+    lines.append("\n点击文件名查看详情")
     return "\n".join(lines)
 
 def text_file_info(fid: int) -> str:
@@ -473,23 +522,45 @@ def text_file_info(fid: int) -> str:
     if not p or not p.exists():
         return "❌ 文件不存在或已被删除"
     stat = p.stat()
+    row  = db_get_row(fid)
     rel  = p.relative_to(DOWNLOAD_ROOT) if DOWNLOAD_ROOT in p.parents else p
+    dl_by = f"用户 {row['downloaded_by']}" if row and row["downloaded_by"] else "未知"
+    dl_at = row["downloaded_at"] if row else "未知"
     return (
         f"📄 **文件详情**\n\n"
         f"🏷 名称：`{p.name}`\n"
         f"📦 大小：{fmt_size(stat.st_size)}\n"
-        f"🕐 创建：{fmt_ts(stat.st_ctime)}\n"
-        f"🕑 修改：{fmt_ts(stat.st_mtime)}\n"
-        f"📂 路径：`{rel}`\n"
+        f"🕐 下载时间：{dl_at}\n"
+        f"👤 下载者：{dl_by}\n"
+        f"🕑 最后修改：{fmt_ts(stat.st_mtime)}\n"
+        f"📂 相对路径：`{rel}`\n"
         f"💾 完整路径：\n`{p.resolve()}`"
     )
 
 def text_delete_select() -> str:
     per, tf, ts = calc_stats()
-    lines = [f"🗑️ **删除文件**  共 {tf} 个 / {fmt_size(ts)}\n\n选择要删除的范围："]
+    lines = [f"🗑️ **删除文件**  共 {tf} 个 / {fmt_size(ts)}\n\n选择删除范围："]
     for mtype, (cnt, size) in per.items():
         lines.append(f"  {media_emoji(mtype)} **{mtype}**：{cnt} 个  {fmt_size(size)}")
-    lines.append(f"\n⚠️ 删除操作**不可恢复**，请谨慎操作！")
+    lines.append("\n⚠️ 删除操作**不可恢复**！")
+    return "\n".join(lines)
+
+def text_search_results(keyword: str, rows: list, page: int) -> str:
+    total   = len(rows)
+    total_p = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+    start   = page * PAGE_SIZE
+    if not total:
+        return f"🔍 搜索 **`{keyword}`**\n\n📭 没有找到匹配的文件"
+    lines = [f"🔍 搜索 **`{keyword}`**  共 {total} 条  第 {page+1}/{total_p} 页\n"]
+    for i, row in enumerate(rows[start:start + PAGE_SIZE], start=start + 1):
+        p      = Path(row["path"])
+        exists = "✅" if p.exists() else "❌"
+        lines.append(
+            f"  {exists} `{i}.` {row['file_name'][:34]}  "
+            f"_{fmt_size(row['file_size'])}_  "
+            f"{row['downloaded_at'][:10]}"
+        )
+    lines.append("\n点击文件名查看详情")
     return "\n".join(lines)
 
 # ══════════════════════════════════════════════
@@ -505,21 +576,44 @@ def make_progress(status_msg: Message, file_name: str,
         now = time.monotonic()
         if (now - last_t[0]) < PROGRESS_UPDATE_SEC and current < total:
             return
-        last_t[0] = now
+        last_t[0]  = now
         total_real = total or total_hint or current
         pct        = current / total_real * 100 if total_real else 0
         elapsed    = max(now - start_t[0], 0.001)
         speed      = current / elapsed
         eta        = (total_real - current) / speed if speed > 0 and total_real > current else 0
-        text = (
-            f"{media_emoji(media_type)} **正在下载**\n"
-            f"`{file_name}`\n\n"
-            f"`{pbar(pct)}` **{pct:.1f}%**\n"
-            f"📦 {fmt_size(current)} / {fmt_size(total_real)}\n"
-            f"⚡ {fmt_speed(speed)}   ⏱ 剩余 {fmt_eta(eta)}"
-        )
         try:
-            await status_msg.edit_text(text)
+            await status_msg.edit_text(
+                f"{media_emoji(media_type)} **正在下载**\n`{file_name}`\n\n"
+                f"`{pbar(pct)}` **{pct:.1f}%**\n"
+                f"📦 {fmt_size(current)} / {fmt_size(total_real)}\n"
+                f"⚡ {fmt_speed(speed)}   ⏱ 剩余 {fmt_eta(eta)}"
+            )
+        except Exception:
+            pass
+
+    return _cb
+
+def make_upload_progress(status_msg: Message, file_name: str, total_size: int):
+    last_t  = [0.0]
+    start_t = [time.monotonic()]
+
+    async def _cb(current: int, total: int):
+        now = time.monotonic()
+        if (now - last_t[0]) < PROGRESS_UPDATE_SEC and current < total:
+            return
+        last_t[0]  = now
+        total_real = total or total_size or current
+        pct        = current / total_real * 100 if total_real else 0
+        elapsed    = max(now - start_t[0], 0.001)
+        speed      = current / elapsed
+        try:
+            await status_msg.edit_text(
+                f"📤 **正在回传**\n`{file_name}`\n\n"
+                f"`{pbar(pct)}` **{pct:.1f}%**\n"
+                f"📦 {fmt_size(current)} / {fmt_size(total_real)}\n"
+                f"⚡ {fmt_speed(speed)}"
+            )
         except Exception:
             pass
 
@@ -529,170 +623,223 @@ def make_progress(status_msg: Message, file_name: str,
 #  命令处理器
 # ══════════════════════════════════════════════
 
+def _uid(msg: Message) -> int | None:
+    return msg.from_user.id if msg.from_user else None
+
 @bot.on_message(filters.command("start") & (filters.private | filters.group))
 async def cmd_start(_, msg: Message):
-    uid = msg.from_user.id if msg.from_user else None
-    if not is_allowed(uid):
-        return
+    if not is_allowed(_uid(msg)): return
     name = msg.from_user.first_name if msg.from_user else "用户"
     await msg.reply_text(text_home(name), reply_markup=kb_main())
 
 @bot.on_message(filters.command("menu") & (filters.private | filters.group))
 async def cmd_menu(_, msg: Message):
-    uid = msg.from_user.id if msg.from_user else None
-    if not is_allowed(uid):
-        return
+    if not is_allowed(_uid(msg)): return
     name = msg.from_user.first_name if msg.from_user else "用户"
     await msg.reply_text(text_home(name), reply_markup=kb_main())
 
 @bot.on_message(filters.command("status") & (filters.private | filters.group))
 async def cmd_status(_, msg: Message):
-    uid = msg.from_user.id if msg.from_user else None
-    if not is_allowed(uid):
-        return
+    if not is_allowed(_uid(msg)): return
     await msg.reply_text(text_status(), reply_markup=kb_back())
 
 @bot.on_message(filters.command("dirs") & (filters.private | filters.group))
 async def cmd_dirs(_, msg: Message):
-    uid = msg.from_user.id if msg.from_user else None
-    if not is_allowed(uid):
-        return
+    if not is_allowed(_uid(msg)): return
     await msg.reply_text(text_dirs(), reply_markup=kb_back())
 
 @bot.on_message(filters.command("browse") & (filters.private | filters.group))
 async def cmd_browse(_, msg: Message):
-    uid = msg.from_user.id if msg.from_user else None
-    if not is_allowed(uid):
-        return
-    await msg.reply_text(
-        text_browse_select(),
-        reply_markup=kb_type_select("browse", back="menu:home"),
-    )
+    if not is_allowed(_uid(msg)): return
+    await msg.reply_text(text_browse_select(),
+                         reply_markup=kb_type_select("browse", back="menu:home"))
 
 @bot.on_message(filters.command("delete") & (filters.private | filters.group))
 async def cmd_delete(_, msg: Message):
-    uid = msg.from_user.id if msg.from_user else None
-    if not is_allowed(uid):
-        return
+    if not is_allowed(_uid(msg)): return
     await msg.reply_text(text_delete_select(), reply_markup=kb_batch_type_select())
 
+@bot.on_message(filters.command("search") & (filters.private | filters.group))
+async def cmd_search(_, msg: Message):
+    if not is_allowed(_uid(msg)): return
+    parts = msg.text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await msg.reply_text(
+            "🔍 **文件搜索**\n\n用法：`/search 关键词`\n\n"
+            "支持文件名模糊匹配，例如：\n"
+            "`/search video`\n`/search 2024`\n`/search .mp4`"
+        )
+        return
+    keyword = parts[1].strip()
+    rows    = db_search(keyword)
+    await msg.reply_text(
+        text_search_results(keyword, rows, 0),
+        reply_markup=kb_search_results(rows, keyword, 0),
+    )
+
 # ══════════════════════════════════════════════
-#  内联按钮回调处理
+#  内联按钮回调
 # ══════════════════════════════════════════════
 
 @bot.on_callback_query()
 async def on_callback(_, cq: CallbackQuery):
     uid = cq.from_user.id
     if not is_allowed(uid):
-        await cq.answer("⛔ 无权限", show_alert=True)
-        return
+        await cq.answer("⛔ 无权限", show_alert=True); return
 
     data = cq.data
     name = cq.from_user.first_name or "用户"
 
-    # ── 无操作占位 ────────────────────────────
+    # ── 占位 ──────────────────────────────────
     if data == "noop":
-        await cq.answer()
-        return
+        await cq.answer(); return
 
     # ── 主菜单 ────────────────────────────────
-    if data == "menu:home":
+    elif data == "menu:home":
         await cq.message.edit_text(text_home(name), reply_markup=kb_main())
         await cq.answer()
 
-    # ── 下载统计 ──────────────────────────────
     elif data == "menu:status":
-        await cq.message.edit_text(text_status(), reply_markup=InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("🔄 刷新",  callback_data="menu:status"),
-                InlineKeyboardButton("« 返回",   callback_data="menu:home"),
-            ]
-        ]))
+        await cq.message.edit_text(text_status(), reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔄 刷新", callback_data="menu:status"),
+            InlineKeyboardButton("« 返回",  callback_data="menu:home"),
+        ]]))
         await cq.answer("已刷新")
 
-    # ── 目录结构 ──────────────────────────────
     elif data == "menu:dirs":
-        await cq.message.edit_text(text_dirs(), reply_markup=InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("🔄 刷新",  callback_data="menu:dirs"),
-                InlineKeyboardButton("« 返回",   callback_data="menu:home"),
-            ]
-        ]))
+        await cq.message.edit_text(text_dirs(), reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔄 刷新", callback_data="menu:dirs"),
+            InlineKeyboardButton("« 返回",  callback_data="menu:home"),
+        ]]))
         await cq.answer()
 
-    # ── 类型开关面板 ──────────────────────────
     elif data == "menu:types":
         await cq.message.edit_text(text_types(), reply_markup=kb_types())
         await cq.answer()
 
-    # ── 切换单个类型 ──────────────────────────
     elif data.startswith("toggle:"):
         mtype = data.split(":", 1)[1]
         if mtype in ENABLED_TYPES:
             ENABLED_TYPES[mtype] = not ENABLED_TYPES[mtype]
-            state = "✅ 已启用" if ENABLED_TYPES[mtype] else "❌ 已停用"
+            state = "✅ 启用" if ENABLED_TYPES[mtype] else "❌ 停用"
             await cq.answer(f"{media_emoji(mtype)} {mtype} {state}")
         await cq.message.edit_text(text_types(), reply_markup=kb_types())
 
-    # ── 当前设置 ──────────────────────────────
     elif data == "menu:settings":
         await cq.message.edit_text(text_settings(), reply_markup=kb_back())
         await cq.answer()
 
-    # ════════════════════════════════════════════
-    #  ★ 浏览文件
-    # ════════════════════════════════════════════
-
+    # ── 浏览 ──────────────────────────────────
     elif data == "menu:browse":
-        await cq.message.edit_text(
-            text_browse_select(),
-            reply_markup=kb_type_select("browse", back="menu:home"),
-        )
+        await cq.message.edit_text(text_browse_select(),
+                                   reply_markup=kb_type_select("browse", back="menu:home"))
         await cq.answer()
 
     elif data.startswith("browse:"):
-        # browse:{mtype}:{page}
-        parts = data.split(":")
-        mtype, page = parts[1], int(parts[2])
+        _, mtype, page = data.split(":"); page = int(page)
         files = list_files_for_type(mtype)
         if not files:
-            await cq.answer(f"📭 {mtype} 目录为空", show_alert=True)
-            return
-        await cq.message.edit_text(
-            text_file_list(mtype, page, files),
-            reply_markup=kb_file_list(mtype, page, files),
-        )
+            await cq.answer(f"📭 {mtype} 目录为空", show_alert=True); return
+        await cq.message.edit_text(text_file_list(mtype, page, files),
+                                   reply_markup=kb_file_list(mtype, page, files))
         await cq.answer()
 
-    # ── 文件详情 ──────────────────────────────
+    # ── 文件详情（来自浏览）──────────────────
     elif data.startswith("finfo:"):
         fid = int(data.split(":")[1])
         p   = _lookup_path(fid)
         if not p or not p.exists():
-            await cq.answer("❌ 文件不存在", show_alert=True)
-            return
-        # 猜回媒体类型和页码（用于返回）
+            await cq.answer("❌ 文件不存在", show_alert=True); return
         mtype = next(
-            (mt for mt, base in MEDIA_DIRS.items() if base in p.parents or base == p.parent.parent),
-            "document"
+            (mt for mt, base in MEDIA_DIRS.items()
+             if base in p.parents or base == p.parent.parent),
+            "document",
         )
         files = list_files_for_type(mtype)
         page  = next((i // PAGE_SIZE for i, f in enumerate(files) if f == p), 0)
+        await cq.message.edit_text(text_file_info(fid),
+                                   reply_markup=kb_file_info(fid, mtype, page))
+        await cq.answer()
+
+    # ── 文件详情（来自搜索）──────────────────
+    elif data.startswith("finfo_s:"):
+        parts   = data.split(":", 2)
+        fid     = int(parts[1])
+        keyword = parts[2] if len(parts) > 2 else ""
+        p = _lookup_path(fid)
+        if not p or not p.exists():
+            await cq.answer("❌ 文件不存在", show_alert=True); return
+        mtype = next(
+            (mt for mt, base in MEDIA_DIRS.items()
+             if base in p.parents or base == p.parent.parent),
+            "document",
+        )
         await cq.message.edit_text(
             text_file_info(fid),
-            reply_markup=kb_file_info(fid, mtype, page),
+            reply_markup=kb_file_info(fid, mtype, 0, back_search=keyword),
         )
         await cq.answer()
 
-    # ── 单文件删除：确认询问 ──────────────────
+    # ── 搜索返回 ──────────────────────────────
+    elif data.startswith("search_back:"):
+        keyword = data.split(":", 1)[1]
+        rows    = db_search(keyword)
+        await cq.message.edit_text(
+            text_search_results(keyword, rows, 0),
+            reply_markup=kb_search_results(rows, keyword, 0),
+        )
+        await cq.answer()
+
+    # ── 搜索翻页 ──────────────────────────────
+    elif data.startswith("search:"):
+        parts   = data.split(":")
+        keyword = parts[1]; page = int(parts[2])
+        rows    = db_search(keyword)
+        await cq.message.edit_text(
+            text_search_results(keyword, rows, page),
+            reply_markup=kb_search_results(rows, keyword, page),
+        )
+        await cq.answer()
+
+    # ── 文件回传 ──────────────────────────────
+    elif data.startswith("fsend:"):
+        fid = int(data.split(":")[1])
+        p   = _lookup_path(fid)
+        if not p or not p.exists():
+            await cq.answer("❌ 文件不存在", show_alert=True); return
+
+        await cq.answer("📤 开始回传…")
+        status      = await cq.message.reply_text(
+            f"📤 准备回传\n`{p.name}`  ({fmt_size(p.stat().st_size)})"
+        )
+        progress_cb = make_upload_progress(status, p.name, p.stat().st_size)
+
+        ext = p.suffix.lower()
+        try:
+            if ext in (".jpg", ".jpeg", ".png", ".webp"):
+                sent = await cq.message.reply_photo(str(p), progress=progress_cb)
+            elif ext in (".mp4", ".mov", ".avi", ".mkv"):
+                sent = await cq.message.reply_video(str(p), progress=progress_cb)
+            elif ext in (".mp3", ".m4a", ".flac", ".aac"):
+                sent = await cq.message.reply_audio(str(p), progress=progress_cb)
+            elif ext in (".ogg", ".oga"):
+                sent = await cq.message.reply_voice(str(p), progress=progress_cb)
+            elif ext in (".gif",):
+                sent = await cq.message.reply_animation(str(p), progress=progress_cb)
+            else:
+                sent = await cq.message.reply_document(str(p), progress=progress_cb)
+            await status.delete()
+            logger.info(f"📤 回传成功 {p.name} → msg_id={sent.id}")
+        except Exception as exc:
+            logger.error(f"回传失败 {p.name}: {exc}")
+            await status.edit_text(f"❌ **回传失败**\n`{exc}`")
+
+    # ── 单文件删除：询问 ──────────────────────
     elif data.startswith("fdel_ask:"):
-        # fdel_ask:{fid}:{mtype}:{page}
-        parts = data.split(":")
-        fid, mtype, page = int(parts[1]), parts[2], int(parts[3])
+        _, fid, mtype, page = data.split(":"); fid = int(fid); page = int(page)
         p = _lookup_path(fid)
         if not p or not p.exists():
-            await cq.answer("❌ 文件不存在", show_alert=True)
-            return
+            await cq.answer("❌ 文件不存在", show_alert=True); return
         await cq.message.edit_text(
             f"🗑️ **确认删除？**\n\n"
             f"📄 `{p.name}`\n"
@@ -705,61 +852,42 @@ async def on_callback(_, cq: CallbackQuery):
 
     # ── 单文件删除：执行 ──────────────────────
     elif data.startswith("fdel_do:"):
-        # fdel_do:{fid}:{mtype}:{page}
-        parts = data.split(":")
-        fid, mtype, page = int(parts[1]), parts[2], int(parts[3])
+        _, fid, mtype, page = data.split(":"); fid = int(fid); page = int(page)
         p = _lookup_path(fid)
         if not p or not p.exists():
             await cq.answer("❌ 文件已不存在", show_alert=True)
-            # 返回列表
             files = list_files_for_type(mtype)
-            await cq.message.edit_text(
-                text_file_list(mtype, page, files),
-                reply_markup=kb_file_list(mtype, page, files),
-            )
+            await cq.message.edit_text(text_file_list(mtype, page, files),
+                                       reply_markup=kb_file_list(mtype, page, files))
             return
-
-        name_del = p.name
-        size_del = p.stat().st_size
+        name_del = p.name; size_del = p.stat().st_size
         try:
             p.unlink()
             _unregister_path(fid)
-            # 清理空目录
-            try:
-                p.parent.rmdir()
-            except OSError:
-                pass
+            try: p.parent.rmdir()
+            except OSError: pass
             logger.info(f"🗑️ 已删除 [{mtype}] {name_del} ({fmt_size(size_del)})")
         except Exception as exc:
-            await cq.answer(f"❌ 删除失败：{exc}", show_alert=True)
-            return
+            await cq.answer(f"❌ 删除失败：{exc}", show_alert=True); return
 
         await cq.answer(f"✅ 已删除 {name_del}")
-        # 刷新列表
-        files = list_files_for_type(mtype)
-        # 防止页码越界
+        files   = list_files_for_type(mtype)
         total_p = max(1, (len(files) + PAGE_SIZE - 1) // PAGE_SIZE)
         page    = min(page, total_p - 1)
         if files:
-            await cq.message.edit_text(
-                text_file_list(mtype, page, files),
-                reply_markup=kb_file_list(mtype, page, files),
-            )
+            await cq.message.edit_text(text_file_list(mtype, page, files),
+                                       reply_markup=kb_file_list(mtype, page, files))
         else:
             await cq.message.edit_text(
                 f"✅ **已删除** `{name_del}`\n\n📭 {mtype} 目录现在为空。",
                 reply_markup=kb_back("menu:browse"),
             )
 
-    # ════════════════════════════════════════════
-    #  ★ 批量删除
-    # ════════════════════════════════════════════
-
+    # ── 批量删除 ──────────────────────────────
     elif data == "menu:delete":
         await cq.message.edit_text(text_delete_select(), reply_markup=kb_batch_type_select())
         await cq.answer()
 
-    # ── 批量删除：确认询问 ────────────────────
     elif data.startswith("bdel_ask:"):
         mtype = data.split(":", 1)[1]
         if mtype == "ALL":
@@ -768,71 +896,46 @@ async def on_callback(_, cq: CallbackQuery):
         else:
             per, _, _ = calc_stats()
             cnt, size = per.get(mtype, (0, 0))
-            em   = media_emoji(mtype)
-            desc = f"{em} **{mtype}**  {cnt} 个文件  {fmt_size(size)}"
-
+            desc = f"{media_emoji(mtype)} **{mtype}**  {cnt} 个  {fmt_size(size)}"
         await cq.message.edit_text(
-            f"🗑️ **批量删除确认**\n\n"
-            f"即将删除：{desc}\n\n"
-            f"⚠️ 此操作**永久删除磁盘文件，不可恢复**！",
+            f"🗑️ **批量删除确认**\n\n即将删除：{desc}\n\n⚠️ **永久删除，不可恢复！**",
             reply_markup=kb_batch_del_confirm(mtype),
         )
         await cq.answer()
 
-    # ── 批量删除：执行 ────────────────────────
     elif data.startswith("bdel_do:"):
-        mtype = data.split(":", 1)[1]
-        deleted_cnt  = 0
-        deleted_size = 0
-        errors       = []
-
-        targets: list[Path] = []
-        if mtype == "ALL":
-            for base in MEDIA_DIRS.values():
-                if base.exists():
-                    targets.append(base)
-        else:
-            base = MEDIA_DIRS.get(mtype)
-            if base and base.exists():
-                targets.append(base)
-
+        mtype   = data.split(":", 1)[1]
+        targets = (list(MEDIA_DIRS.values()) if mtype == "ALL"
+                   else ([MEDIA_DIRS[mtype]] if mtype in MEDIA_DIRS else []))
+        deleted_cnt = deleted_size = 0
         for base in targets:
-            try:
-                files = [f for f in base.rglob("*") if f.is_file()]
-                for f in files:
-                    sz = f.stat().st_size
-                    fid_key = _PATH_TO_FID.get(str(f.resolve()))
-                    f.unlink()
-                    deleted_cnt  += 1
-                    deleted_size += sz
-                    if fid_key:
-                        _FILE_REGISTRY.pop(fid_key, None)
-                        _PATH_TO_FID.pop(str(f.resolve()), None)
-                # 删除空子目录
-                for d in sorted(base.rglob("*"), reverse=True):
-                    if d.is_dir():
-                        try:
-                            d.rmdir()
-                        except OSError:
-                            pass
-            except Exception as exc:
-                errors.append(str(exc))
+            if not base.exists(): continue
+            for f in [f for f in base.rglob("*") if f.is_file()]:
+                sz      = f.stat().st_size
+                fid_key = _PATH_TO_FID.get(str(f.resolve()))
+                f.unlink()
+                deleted_cnt += 1; deleted_size += sz
+                if fid_key:
+                    _FILE_REGISTRY.pop(fid_key, None)
+                    _PATH_TO_FID.pop(str(f.resolve()), None)
+                    with _db() as conn:
+                        conn.execute("DELETE FROM files WHERE id=?", (fid_key,))
+            for d in sorted(base.rglob("*"), reverse=True):
+                if d.is_dir():
+                    try: d.rmdir()
+                    except OSError: pass
 
         label = "全部" if mtype == "ALL" else mtype
-        logger.info(f"🗑️ 批量删除 [{label}] {deleted_cnt} 个文件  {fmt_size(deleted_size)}")
-
-        err_text = f"\n⚠️ {len(errors)} 个错误" if errors else ""
+        logger.info(f"🗑️ 批量删除 [{label}] {deleted_cnt} 个  {fmt_size(deleted_size)}")
         await cq.message.edit_text(
             f"✅ **批量删除完成**\n\n"
             f"🗂️ 范围：**{label}**\n"
             f"📄 已删除：**{deleted_cnt}** 个文件\n"
-            f"💾 释放空间：**{fmt_size(deleted_size)}**{err_text}",
-            reply_markup=InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton("🗑️ 继续删除", callback_data="menu:delete"),
-                    InlineKeyboardButton("🏠 主菜单",   callback_data="menu:home"),
-                ]
-            ]),
+            f"💾 释放空间：**{fmt_size(deleted_size)}**",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🗑️ 继续删除", callback_data="menu:delete"),
+                InlineKeyboardButton("🏠 主菜单",   callback_data="menu:home"),
+            ]]),
         )
         await cq.answer(f"✅ 已删除 {deleted_cnt} 个文件", show_alert=True)
 
@@ -840,49 +943,40 @@ async def on_callback(_, cq: CallbackQuery):
         await cq.answer("未知操作")
 
 # ══════════════════════════════════════════════
-#  核心：媒体消息处理
+#  核心：媒体下载
 # ══════════════════════════════════════════════
 
 MEDIA_FILTER = (
-    filters.photo      |
-    filters.video      |
-    filters.audio      |
-    filters.voice      |
-    filters.document   |
-    filters.sticker    |
-    filters.animation  |
-    filters.video_note
+    filters.photo | filters.video | filters.audio | filters.voice |
+    filters.document | filters.sticker | filters.animation | filters.video_note
 )
 
 @bot.on_message(MEDIA_FILTER & (filters.private | filters.group))
 async def handle_media(_client: Client, msg: Message):
-    uid = msg.from_user.id if msg.from_user else None
-    if not is_allowed(uid):
-        return
+    uid = _uid(msg)
+    if not is_allowed(uid): return
 
     media_type, file_name = detect_media(msg)
-    if media_type is None:
-        return
+    if media_type is None: return
 
     if not ENABLED_TYPES.get(media_type, True):
         await msg.reply_text(
-            f"{media_emoji(media_type)} **{media_type}** 类型已停用，跳过下载。\n"
-            f"可在菜单 → 🔧 类型开关 中重新启用。",
+            f"{media_emoji(media_type)} **{media_type}** 类型已停用。",
             reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("🔧 打开类型开关", callback_data="menu:types")
-            ]])
+                InlineKeyboardButton("🔧 类型开关", callback_data="menu:types")
+            ]]),
         )
         return
 
-    safe_name = "".join(c if c not in r'\/:*?"<>|' else "_" for c in file_name)
-    save_dir  = get_save_dir(media_type)
-    save_path = safe_path(save_dir, safe_name)
-    file_size = get_file_size(msg)
-    em        = media_emoji(media_type)
+    safe_name  = "".join(c if c not in r'\/:*?"<>|' else "_" for c in file_name)
+    save_dir   = get_save_dir(media_type)
+    save_path  = safe_path(save_dir, safe_name)
+    file_size  = get_file_size(msg)
+    em         = media_emoji(media_type)
 
-    size_hint = f"  ({fmt_size(file_size)})" if file_size else ""
-    status = await msg.reply_text(f"{em} 准备下载{size_hint}\n`{safe_name}` ...")
-
+    status      = await msg.reply_text(
+        f"{em} 准备下载{f'  ({fmt_size(file_size)})' if file_size else ''}\n`{safe_name}` ..."
+    )
     progress_cb = make_progress(status, safe_name, media_type, file_size)
 
     t0 = time.monotonic()
@@ -897,10 +991,11 @@ async def handle_media(_client: Client, msg: Message):
     act_size = save_path.stat().st_size if save_path.exists() else 0
     avg_spd  = act_size / elapsed if elapsed > 0 else 0
 
-    # 注册到文件表，供浏览/删除使用
-    fid = _register_path(save_path)
-
-    logger.info(f"✅ [{media_type}] {save_path.name} ({fmt_size(act_size)}, {fmt_speed(avg_spd)}, {elapsed:.1f}s)")
+    fid = db_register(save_path, media_type, uid)
+    logger.info(
+        f"✅ [{media_type}] {save_path.name} fid={fid} "
+        f"({fmt_size(act_size)}, {fmt_speed(avg_spd)}, {elapsed:.1f}s)"
+    )
 
     await status.edit_text(
         f"{em} **下载完成！**\n\n"
@@ -911,14 +1006,15 @@ async def handle_media(_client: Client, msg: Message):
         f"💾 `{save_path}`",
         reply_markup=InlineKeyboardMarkup([
             [
-                InlineKeyboardButton("🔍 查看详情",   callback_data=f"finfo:{fid}"),
-                InlineKeyboardButton("🗑️ 立即删除",   callback_data=f"fdel_ask:{fid}:{media_type}:0"),
+                InlineKeyboardButton("🔍 查看详情", callback_data=f"finfo:{fid}"),
+                InlineKeyboardButton("📤 回传文件", callback_data=f"fsend:{fid}"),
+                InlineKeyboardButton("🗑️ 立即删除", callback_data=f"fdel_ask:{fid}:{media_type}:0"),
             ],
             [
-                InlineKeyboardButton("📊 查看统计",   callback_data="menu:status"),
-                InlineKeyboardButton("🏠 主菜单",     callback_data="menu:home"),
+                InlineKeyboardButton("📊 查看统计", callback_data="menu:status"),
+                InlineKeyboardButton("🏠 主菜单",   callback_data="menu:home"),
             ],
-        ])
+        ]),
     )
 
 # ══════════════════════════════════════════════
@@ -927,7 +1023,14 @@ async def handle_media(_client: Client, msg: Message):
 
 if __name__ == "__main__":
     DOWNLOAD_ROOT.mkdir(parents=True, exist_ok=True)
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+    db_init()
+    db_load_registry()
+
     logger.info(f"📁 下载目录：{DOWNLOAD_ROOT.resolve()}")
+    logger.info(f"💾 数据库：{DB_PATH.resolve()}")
+    logger.info(f"📋 已加载历史记录：{len(_FILE_REGISTRY)} 条")
     logger.info(f"👤 白名单：{'全部用户' if not ALLOWED_USERS else ALLOWED_USERS}")
-    logger.info("🤖 Bot 启动中（Pyrogram · MTProto · 内联菜单 · 浏览/删除）…")
+    logger.info("🤖 Bot 启动（Pyrogram · MTProto · 持久化 · 搜索 · 回传）…")
     bot.run()
