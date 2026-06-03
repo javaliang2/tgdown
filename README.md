@@ -3,7 +3,7 @@ git clone https://github.com/lje02/tgdown.git
 cd tgdown
 
 # 2️⃣ 运行一键部署脚本
-bash install-enhanced.sh
+bash install.sh
 
 # 3️⃣ 脚本会引导你：
 #    ✅ 检测环境（OS、Python、Docker）
@@ -29,4 +29,4 @@ git clone git://git.kernel.org/pub/scm/git/git.git
 ## 一键安装
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/lje02/tgdown/main/install-enhanced.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/lje02/tgdown/main/install.sh)
