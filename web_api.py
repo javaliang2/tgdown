@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Web 界面后端 API 服务
+Web 界面后端 API 服务（增强版）
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-支持文件列表、搜索、认证等功能
+支持文件列表、搜索、在线播放等功能
 与 bot-enhanced.py 共享数据库
 """
 
@@ -15,14 +15,17 @@ from pathlib import Path
 from datetime import datetime, timedelta
 from functools import wraps
 
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify, send_from_directory, send_file
 from flask_cors import CORS
 from dotenv import load_dotenv
 import jwt
 
+# 导入流媒体模块
+from web_streaming import register_streaming_routes
+
 # ══════════════════════════════════════════════════════════════
 #  初始化
-# ══════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════���══════════════════════
 load_dotenv()
 
 app = Flask(__name__, static_folder='web', static_url_path='')
@@ -190,6 +193,11 @@ def index():
     """返回 Web 界面"""
     return send_from_directory(app.static_folder, 'index.html')
 
+@app.route('/player')
+def player():
+    """播放器页面"""
+    return send_from_directory(app.static_folder, 'player.html')
+
 @app.route('/api/login', methods=['POST'])
 def login():
     """
@@ -305,7 +313,7 @@ def get_file_info(file_id):
 @app.route('/api/download/<int:file_id>')
 @token_required
 def download_file(file_id):
-    """获取文件下载链接（流媒体地址）"""
+    """下载文件"""
     try:
         conn = get_db()
         row = conn.execute(
@@ -322,16 +330,47 @@ def download_file(file_id):
         if not file_path.exists():
             return jsonify({'error': '文件已删除'}), 404
         
-        # 返回文件的相对路径和直接访问 URL
-        download_url = f"/downloads/{file_path.name}"
+        # 返回文件下载
+        return send_file(
+            file_path,
+            as_attachment=True,
+            download_name=row['file_name']
+        )
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/play/<int:file_id>')
+@token_required
+def play_file(file_id):
+    """
+    获取播放器链接
+    返回播放器页面的 URL
+    """
+    try:
+        conn = get_db()
+        row = conn.execute(
+            "SELECT * FROM files WHERE id = ?",
+            (file_id,)
+        ).fetchone()
+        conn.close()
+        
+        if not row:
+            return jsonify({'error': '文件不存在'}), 404
+        
+        file_path = Path(row['path'])
+        if not file_path.exists():
+            return jsonify({'error': '文件已删除'}), 404
+        
+        # 生成播放器 URL
+        token = request.args.get('token')
+        player_url = f"/player?id={file_id}&token={token}"
         
         return jsonify({
             'success': True,
             'file_id': file_id,
             'file_name': row['file_name'],
-            'file_size': row['file_size'],
             'media_type': row['media_type'],
-            'download_url': download_url
+            'player_url': player_url
         })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -341,9 +380,9 @@ def health():
     """健康检查"""
     return jsonify({'status': 'ok'})
 
-# ���═════════════════════════════════════════════════════════════
-#  错误处理
 # ══════════════════════════════════════════════════════════════
+#  错误处理
+# ═════════════════════════════════════════════���════════════════
 
 @app.errorhandler(404)
 def not_found(error):
@@ -352,6 +391,12 @@ def not_found(error):
 @app.errorhandler(500)
 def internal_error(error):
     return jsonify({'error': 'Internal server error'}), 500
+
+# ══════════════════════════════════════════════════════════════
+#  注册流媒体路由
+# ══════════════════════════════════════════════════════════════
+
+register_streaming_routes(app, DB_PATH, DOWNLOAD_ROOT)
 
 # ══════════════════════════════════════════════════════════════
 #  启动
@@ -363,6 +408,7 @@ if __name__ == '__main__':
     
     print(f"🌐 Web 服务启动：http://localhost:{port}")
     print(f"🔐 请使用 .env 中的 WEB_PASSWORD 登录")
+    print(f"🎬 播放器：http://localhost:{port}/player?id=<file_id>&token=<token>")
     
     app.run(
         host='0.0.0.0',
