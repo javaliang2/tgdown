@@ -1,5 +1,5 @@
 # 1️⃣ 克隆项目
-git clone https://github.com/javaliang2/tgdown.git
+git clone https://github.com/lje02/tgdown.git
 cd tgdown
 
 # 2️⃣ 运行一键部署脚本
@@ -29,4 +29,4 @@ git clone git://git.kernel.org/pub/scm/git/git.git
 ## 一键安装
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/javaliang2/tgdown/main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/lje02/tgdown/main/install-enhanced.sh)
