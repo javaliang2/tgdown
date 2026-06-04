@@ -18,6 +18,11 @@ bash install.sh
 
 停止服务：sudo systemctl stop tg-downloader
 
+python3安装：
+
+apt update && apt install python3.11-venv -y
+
+
 git安装
 
 sudo apt install git-all
