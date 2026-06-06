@@ -1,0 +1,23 @@
+# 敏感配置
+bots/downloader/.env
+bots/relay/config.py
+bots/relay/.env
+
+# Session / 下载 / 数据库
+bots/*/session/
+bots/*/downloads/
+bots/*/*.db
+bots/*/*.session
+
+# Docker 自动生成文件
+bots/*/Dockerfile
+bots/*/docker-compose.yml
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# macOS
+.DS_Store
+*.log
