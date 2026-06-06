@@ -1,23 +1,27 @@
 # 1️⃣ 克隆项目
-git clone https://github.com/javaliang2/tgdown.git
+git clone https://github.com/lje02/tgdown.git
 cd tgdown
 
 # 2️⃣ 运行一键部署脚本
-bash install-enhanced.sh
+bash install.sh
 
 # 3️⃣ 脚本会引导你：
-#    ✅ 检测环境（OS、Python、Docker）
-#    ✅ 选择部署方式（Docker/Supervisor/Systemd/本地）
+#    ✅ 检测环境（OS、Python）
+#    ✅ 选择部署方式（Supervisor/Systemd/本地）
 #    ✅ 生成 .env 配置文件
 #    ✅ 安装依赖
 #    ✅ 启动 Bot
 
-部署方式选择
+查看状态：sudo systemctl status tg-downloader
 
-1️⃣ Docker Compose      → 最简单，推荐新手
-2️⃣ Supervisor          → 生产级，推荐服务器
-3️⃣ Systemd             → Linux 系统，推荐开机自启
-4️⃣ 本地运行            → 开发测试，推荐调试
+查看日志：journalctl -u tg-downloader -f
+
+停止服务：sudo systemctl stop tg-downloader
+
+python3安装：
+
+apt update && apt install python3.11-venv -y
+
 
 git安装
 
@@ -29,4 +33,4 @@ git clone git://git.kernel.org/pub/scm/git/git.git
 ## 一键安装
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/javaliang2/tgdown/main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/lje02/tgdown/main/install.sh)
